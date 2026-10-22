@@ -1,0 +1,9 @@
+.env
+.env.*
+rules.yaml
+data/
+.git/
+tests/
+__pycache__/
+*.pyc
+.pytest_cache/

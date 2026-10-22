@@ -1,0 +1,25 @@
+# Пример правил. Рабочий файл rules.yaml лежит только на сервере (в .gitignore).
+#
+# Ящик -> список правил. Правила проверяются по порядку, срабатывает первое подходящее.
+# Условия (любое из):
+#   from:             точные адреса отправителей
+#   from_domain:      домены отправителей
+#   subject_contains: подстроки в теме (без учёта регистра)
+# Действия:
+#   move_to:   папка назначения (создастся, если её нет)
+#   mark_read: пометить прочитанным (по умолчанию false)
+# skip_folders: папки, которые не трогаем (корзина, спам и черновики пропускаются всегда)
+
+sales@example.ru:
+  rules:
+    - name: Партнёр
+      from: [manager@partner.example, logistics@partner.example]
+      move_to: ПАРТНЁР
+    - name: Банк
+      from_domain: [bank.example]
+      move_to: БАНК
+      mark_read: true
+    - name: Отчёты
+      subject_contains: [отчёт, дислокация]
+      move_to: ОТЧЁТЫ
+  skip_folders: [Archive]

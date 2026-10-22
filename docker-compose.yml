@@ -1,0 +1,16 @@
+services:
+  mail-sorter:
+    build: .
+    image: mail-sorter:latest
+    container_name: mail-sorter
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./rules.yaml:/app/config/rules.yaml:ro
+      - ./data:/app/data
+    mem_limit: 128m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
