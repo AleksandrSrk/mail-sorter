@@ -282,6 +282,13 @@ def check_screen(store, addr: str, own_domains=()):
         data = f"x:ex:{e['rule_id']}:{addr}"
         if e["rule_id"] not in own_addr_rules and len(data.encode()) <= 64:
             buttons.append([(f"↩️ Только {addr} — исключение, во входящие", data)])
+    spam = store.learn_rule()
+    if spam and spam["spam_header"] and dom not in own_domains and \
+            not any(e["rule_id"] == spam["id"] for e in rows):
+        lines.append("Спам-фильтр может поймать его по серверной метке спама.")
+        data = f"x:ex:{spam['id']}:{addr}"
+        if len(data.encode()) <= 64:
+            buttons.append([("✅ Не спам — не трогать по метке сервера, письма во входящие", data)])
     return "\n".join(lines), buttons
 
 
@@ -304,3 +311,64 @@ def restore(store, entry_id: int, own_domains=()):
         text, rows = check_screen(store, addr, own_domains)
         return (text + "\n\n" + note, rows), "Готово"
     return (f"Домен @{e['value']}: {note}", []), "Готово"
+
+
+# ---------- серверный спам: уведомление и решение ----------
+def _short_box(mb):
+    local, _, dom = mb.partition("@")
+    return f"{local}@{dom.split('.')[0]}"
+
+
+def format_notice(n) -> str:
+    who = f"{n['name']} <{n['sender']}>" if n.get("name") else n["sender"]
+    lines = ["🛡 Почтовый сервер пометил письмо как спам — я убрал его в «Нежелательную почту».",
+             f"От: {who}",
+             f"Ящик: {n['mailbox']}" + (f" (таких писем: {n['letters']})" if n.get("letters", 1) > 1 else ""),
+             f"Тема: {n['subject'] or '(без темы)'}"]
+    if n.get("summary"):
+        k = n.get("summarized", 1)
+        lines.append(f"Кратко{f' (по {k} последним письмам)' if k > 1 else ''}: {n['summary']}")
+    boxes = n.get("boxes") or {}
+    sent = {mb: i.get("sent", 0) for mb, i in boxes.items() if i.get("sent")}
+    lines.append("")
+    if sent:
+        lines.append("Переписка — мы ему писали:")
+        lines += [f"  • {_short_box(mb)} — {k}" for mb, k in sorted(sent.items(), key=lambda x: -x[1])]
+    else:
+        lines.append("Переписки нет: ни из одного ящика мы ему не писали.")
+    got = {mb: i for mb, i in boxes.items() if i.get("all")}
+    if got:
+        lines.append("Письма от него по ящикам:")
+        for mb, i in sorted(got.items(), key=lambda x: -x[1]["all"]):
+            sp = f" (в спаме {i['spam']})" if i.get("spam") else ""
+            lines.append(f"  • {_short_box(mb)} — {i['all']}{sp}")
+        rest = len(boxes) - len(got)
+        if rest:
+            lines.append(f"В остальных {rest} ящиках писем от него нет.")
+    if n.get("missing"):
+        lines.append("⚠️ Не проверены: " + ", ".join(n["missing"]))
+    return "\n".join(lines)
+
+
+def notice_buttons(notice_id):
+    return [[("🚫 Оставить в спаме", f"n:keep:{notice_id}:0"), ("✅ Не спам → во входящие", f"n:rel:{notice_id}:0")]]
+
+
+def notice_action(store, data: str):
+    """Кнопка под уведомлением. -> (строка-итог для дописывания к сообщению, короткий ответ)"""
+    try:
+        _, action, ident, _ = data.split(":")
+        ident = int(ident)
+    except ValueError:
+        return None, "Устаревшая кнопка"
+    n, decision = store.decide_notice(ident, {"keep": "keep", "rel": "release"}.get(action, ""))
+    if not n:
+        return None, "Уведомление не найдено"
+    if decision is None:
+        was = "оставлен в спаме" if n["decision"] == "keep" else "возвращён во входящие"
+        return f"Решение уже принято: {was}.", "Уже решено"
+    if decision == "keep":
+        return ("🚫 Решение: спам. Учусь — его письма во всех ящиках уйдут в спам, попробую отписаться. "
+                "Сводка придёт отдельным сообщением.", "Оставлен в спаме")
+    return ("✅ Решение: не спам. Серверная метка его больше не трогает, письма из спама во всех ящиках "
+            "вернутся во входящие. Сводка придёт отдельным сообщением.", "Возвращаю во входящие")

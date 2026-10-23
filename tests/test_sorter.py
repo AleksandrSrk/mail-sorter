@@ -29,7 +29,7 @@ class FakeIMAP:
         n = q.strip('"')
         return "OK", [f'"{n}" (UIDNEXT {self.next[n]} UIDVALIDITY {self.f[n]["validity"]})'.encode()]
 
-    def select(self, q):
+    def select(self, q, readonly=False):
         self.sel = q.strip('"')
         return "OK", [b"1"]
 
@@ -50,10 +50,11 @@ class FakeIMAP:
 
     def uid(self, cmd, *args):
         msgs = self.f[self.sel]["msgs"]
-        if cmd == "SEARCH" and args[1] == "FROM":
+        if cmd == "SEARCH" and args[1] in ("FROM", "TO"):
             needle = args[2].strip('"').lower()
             self.searches.append((self.sel, needle))
-            return "OK", [b" ".join(str(u).encode() for u in sorted(msgs) if needle in msgs[u][0].lower())]
+            pos = 0 if args[1] == "FROM" else 1        # в «Отправленных» адресат лежит в поле темы
+            return "OK", [b" ".join(str(u).encode() for u in sorted(msgs) if needle in msgs[u][pos].lower())]
         if cmd == "SEARCH":
             lo = int(args[2].split(":")[0])
             return "OK", [b" ".join(str(u).encode() for u in sorted(msgs) if u >= lo)]
@@ -66,6 +67,8 @@ class FakeIMAP:
                 lu = msgs[u][3] if len(msgs[u]) > 3 else ""
                 hdr = (f"From: {fr}\r\nSubject: {subj}\r\nTo: {subj}\r\n" + ("X-Spam-Flag: YES\r\n" if flag else "")
                        + (f"List-Unsubscribe: {lu}\r\n" if lu else "") + "\r\n")
+                if "BODY.PEEK[]" in args[1]:
+                    hdr += f"Текст письма от {fr}: предлагаем услуги.\r\n\r\n-- \r\nподпись"
                 out.append((f"{u} (UID {u} BODY[...] {{1}}".encode(), hdr.encode()))
                 out.append(b")")
             return "OK", out

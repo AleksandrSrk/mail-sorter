@@ -21,9 +21,12 @@ class Notifier:
     def enabled(self):
         return bool(self.s.tg_token and self.s.tg_admin)
 
-    def _post(self, text):
-        data = json.dumps({"chat_id": self.s.tg_admin, "text": text,
-                           "disable_web_page_preview": True}).encode()
+    def _post(self, text, buttons=None):
+        payload = {"chat_id": self.s.tg_admin, "text": text, "disable_web_page_preview": True}
+        if buttons:
+            payload["reply_markup"] = {"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row]
+                                                           for row in buttons]}
+        data = json.dumps(payload).encode()
         req = urllib.request.Request(API.format(token=self.s.tg_token), data=data,
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -42,7 +45,7 @@ class Notifier:
             json.dump(st, f)
         os.replace(tmp, self.state_path)
 
-    def send(self, key: str, subject: str, body: str = "", force: bool = False) -> bool:
+    def send(self, key: str, subject: str, body: str = "", force: bool = False, buttons=None) -> bool:
         """key — для ограничения частоты одинаковых сообщений; force — слать без ограничения."""
         if not self.enabled:
             return False
@@ -54,7 +57,7 @@ class Notifier:
         if len(text) > 4000:
             text = text[:3990] + "\n…"
         try:
-            self.transport(text)
+            self.transport(text, buttons) if buttons else self.transport(text)
         except Exception as e:  # уведомление не должно ронять сервис
             log.error("не удалось отправить в Telegram: %s", type(e).__name__)
             return False

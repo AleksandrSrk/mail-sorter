@@ -78,6 +78,17 @@ CREATE TABLE IF NOT EXISTS restores(
     boxes TEXT NOT NULL DEFAULT '{}',  -- {ящик: сколько писем вернули во входящие}
     created_at TEXT, done_at TEXT
 );
+CREATE TABLE IF NOT EXISTS notices(
+    id INTEGER PRIMARY KEY,
+    sender TEXT NOT NULL,
+    name TEXT, mailbox TEXT,      -- где сервер пометил спамом
+    subject TEXT, summary TEXT,
+    lu TEXT, lup TEXT,            -- List-Unsubscribe — на случай «оставить в спаме»
+    letters INTEGER NOT NULL DEFAULT 1,
+    texts TEXT NOT NULL DEFAULT '[]',  -- последние письма отправителя для сводки: [{date, subject, text}]
+    boxes TEXT NOT NULL DEFAULT '{}',  -- {ящик: {"all": писем от него, "spam": из них в спаме, "sent": мы писали}}
+    created_at TEXT, sent_at TEXT, decision TEXT, decided_at TEXT
+);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -107,6 +118,8 @@ class Store:
             self.x("UPDATE rules SET unsubscribe=1 WHERE learn=1")
         if "rule_id" not in {r["name"] for r in self.q("PRAGMA table_info(reports)")}:
             self.x("ALTER TABLE reports ADD COLUMN rule_id INTEGER")
+        if "texts" not in {r["name"] for r in self.q("PRAGMA table_info(notices)")}:
+            self.x("ALTER TABLE notices ADD COLUMN texts TEXT NOT NULL DEFAULT '[]'")
 
     def q(self, sql, *args):
         return self.db.execute(sql, args).fetchall()
@@ -326,6 +339,70 @@ class Store:
 
     def close_restore(self, restore_id, now=None):
         self.x("UPDATE restores SET done_at=? WHERE id=?", now_iso(now), restore_id)
+
+    # ---------- серверный спам: уведомление с выбором ----------
+    def open_notice(self, sender, name, mailbox, subject, summary, lu="", lup="", now=None):
+        """Сервер пометил письмо спамом, мы унесли его в спам — спросить пользователя. Одно уведомление на отправителя."""
+        n = self.one("SELECT id, sent_at FROM notices WHERE sender=? AND decision IS NULL", sender)
+        if n:
+            self.x("UPDATE notices SET letters=letters+1 WHERE id=?", n["id"])
+            return n["id"]
+        self.x("INSERT INTO notices(sender, name, mailbox, subject, summary, lu, lup, created_at) "
+               "VALUES(?,?,?,?,?,?,?,?)", sender, name, mailbox, subject, summary, lu, lup, now_iso(now))
+        return self.one("SELECT last_insert_rowid() AS id")["id"]
+
+    def pending_notices(self, mailbox):
+        """Уведомления, по которым этот ящик ещё не посчитал письма отправителя."""
+        return [n for n in self.q("SELECT * FROM notices WHERE sent_at IS NULL AND decision IS NULL")
+                if mailbox not in json.loads(n["boxes"])]
+
+    def notice_add_texts(self, notice_id, letters, keep=10):
+        """Копим тексты последних писем отправителя (из всех ящиков), без дублей, свежие первыми."""
+        n = self.one("SELECT texts FROM notices WHERE id=?", notice_id)
+        cur = json.loads(n["texts"])
+        seen = {(x["subject"], x["text"][:200]) for x in cur}
+        for x in letters:
+            k = (x["subject"], x["text"][:200])
+            if x["text"].strip() and k not in seen:
+                seen.add(k)
+                cur.append({"date": x.get("date", ""), "subject": x["subject"], "text": x["text"][:4000]})
+        cur.sort(key=lambda x: x["date"], reverse=True)
+        self.x("UPDATE notices SET texts=? WHERE id=?", json.dumps(cur[:keep], ensure_ascii=False), notice_id)
+
+    def notice_progress(self, notice_id, mailbox, info: dict):
+        n = self.one("SELECT boxes FROM notices WHERE id=?", notice_id)
+        boxes = json.loads(n["boxes"])
+        boxes[mailbox] = info
+        self.x("UPDATE notices SET boxes=? WHERE id=?", json.dumps(boxes, ensure_ascii=False), notice_id)
+
+    def ready_notices(self, mailboxes, timeout_min=30, now=None):
+        now = now or datetime.now(timezone.utc)
+        out = []
+        for n in self.q("SELECT * FROM notices WHERE sent_at IS NULL AND decision IS NULL ORDER BY id"):
+            boxes = json.loads(n["boxes"])
+            timed_out = n["created_at"] < now_iso(now - timedelta(minutes=timeout_min))
+            if set(mailboxes) <= set(boxes) or timed_out:
+                out.append(dict(n, boxes=boxes, texts=json.loads(n["texts"]),
+                                missing=sorted(set(mailboxes) - set(boxes))))
+        return out
+
+    def mark_notice_sent(self, notice_id, now=None):
+        self.x("UPDATE notices SET sent_at=? WHERE id=?", now_iso(now), notice_id)
+
+    def decide_notice(self, notice_id, decision, now=None):
+        """keep — учимся как на ручном переносе в спам; release — исключение от метки + возврат во входящие."""
+        n = self.one("SELECT * FROM notices WHERE id=?", notice_id)
+        if not n or n["decision"]:
+            return n, None
+        rule = self.learn_rule()
+        self.x("UPDATE notices SET decision=?, decided_at=? WHERE id=?", decision, now_iso(now), notice_id)
+        if decision == "keep":
+            action = self.learn(n["sender"], n["mailbox"], n["lu"] or "", n["lup"] or "", now=now)
+            self.open_report(n["sender"], n["mailbox"], action or "added", rule_id=rule["id"], now=now)
+        else:
+            eid = self.add_entry(rule["id"], "addr", n["sender"], "bot")
+            self.queue_restore(eid, now=now)
+        return self.one("SELECT * FROM notices WHERE id=?", notice_id), decision
 
     # ---------- contacts (для оценки полезности) ----------
     def add_contacts(self, addresses):

@@ -85,6 +85,16 @@ def build_router(store: Store, admin_id: int, own_domains=()) -> Router:
                 pass
         await c.answer(note)
 
+    @r.callback_query(F.data.startswith("n:"))
+    async def notice(c: CallbackQuery):
+        result, note = views.notice_action(store, c.data)
+        if result:
+            try:
+                await c.message.edit_text(f"{c.message.text}\n\n{result}"[:4000], reply_markup=None)
+            except TelegramBadRequest:
+                pass
+        await c.answer(note)
+
     @r.callback_query(F.data == "noop")
     async def noop(c: CallbackQuery):
         await c.answer()

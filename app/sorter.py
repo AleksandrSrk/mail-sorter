@@ -9,6 +9,7 @@ from collections import Counter, namedtuple
 
 from . import imap_utf7
 from .config import DEFAULT_SKIP_FOLDERS, LearnSpam, Rule
+from .snippet import body_text
 
 log = logging.getLogger("sorter")
 LIST_RE = re.compile(rb'\((?P<flags>.*?)\) "(?P<sep>.)" (?P<name>.*)')
@@ -19,7 +20,7 @@ RCPT_HEADERS = "(BODY.PEEK[HEADER.FIELDS (TO CC BCC)])"
 SENT_FOLDER = "Отправленные"
 CHUNK = 500
 
-Hdr = namedtuple("Hdr", "sender subject flag lu lup")
+Hdr = namedtuple("Hdr", "sender subject flag lu lup name")
 
 
 def _clean(v) -> str:
@@ -66,6 +67,7 @@ class MailboxSorter:
         self.skip = set(DEFAULT_SKIP_FOLDERS)
         self.moved_by_sender = Counter()  # сколько писем каждого отправителя перенесено за проход
         self.learn_folders: dict[str, int] = {}
+        self.contacts: set = set()        # кому мы писали — их серверная метка спама не трогает
 
     def reload_rules(self):
         """Правила читаются из базы перед каждым проходом — правки из бота применяются через минуту."""
@@ -75,6 +77,7 @@ class MailboxSorter:
         # обучаемые папки: спам, БАНК, ДИСЛОКАЦИЯ, ... -> id правила
         self.learn_folders = {r["move_to"]: r["id"] for r in self.store.learn_rules(self.login)}
         self.skip = set(DEFAULT_SKIP_FOLDERS) | {r.move_to for r in self.rules} | set(self.learn_folders)
+        self.contacts = set(self.store.contacts()[0])
 
     # ---------- IMAP helpers ----------
     def _connect(self):
@@ -141,11 +144,13 @@ class MailboxSorter:
                 if not uid:
                     continue
                 msg = email.message_from_bytes(item[1])
-                sender = email.utils.parseaddr(_decode_header(msg.get("From", "")))[1].lower()
+                name, sender = email.utils.parseaddr(_decode_header(msg.get("From", "")))
+                sender = sender.lower()
                 flag = (msg.get("X-Spam-Flag") or "").strip().upper().startswith("YES") or \
                        (msg.get("X-Spam-Status") or "").strip().upper().startswith("YES")
                 out[uid.group(1)] = Hdr(sender, _decode_header(msg.get("Subject", "")), flag,
-                                        _clean(msg.get("List-Unsubscribe")), _clean(msg.get("List-Unsubscribe-Post")))
+                                        _clean(msg.get("List-Unsubscribe")), _clean(msg.get("List-Unsubscribe-Post")),
+                                        name.strip())
         return out
 
     def _fetch_recipients(self, m, uids):
@@ -177,13 +182,39 @@ class MailboxSorter:
         else:
             m.expunge()
 
+    @staticmethod
+    def by_server_flag(rule, h: Hdr) -> bool:
+        """Письмо попало под правило только из-за серверной метки спама (не по нашим спискам)."""
+        return rule.spam_header and h.flag and not rule.matches(h.sender, h.subject, False)
+
     def pick_rule(self, h: Hdr):
         for rule in self.rules:
             if rule.unsubscribe and self.learn and not self.learn.allowed(h.sender):
                 continue  # свои домены никогда не спам
-            if rule.matches(h.sender, h.subject, h.flag):
-                return rule
+            if not rule.matches(h.sender, h.subject, h.flag):
+                continue
+            if self.by_server_flag(rule, h) and h.sender in self.contacts:
+                continue  # мы ему писали — одной метки сервера мало
+            return rule
         return None
+
+    def _fetch_letters(self, m, uids, limit=5):
+        """Последние письма (по UID в папке): [{date, subject, text}] — для сводки в уведомлении."""
+        out = []
+        for uid in sorted(uids, key=int, reverse=True)[:limit]:
+            uid = uid.decode() if isinstance(uid, bytes) else str(uid)
+            typ, data = m.uid("FETCH", uid, "(INTERNALDATE BODY.PEEK[]<0.60000>)")
+            for item in data or []:
+                if isinstance(item, tuple):
+                    date = imaplib.Internaldate2tuple(item[0])
+                    try:
+                        msg = email.message_from_bytes(item[1])
+                        text = body_text(item[1])
+                    except Exception:
+                        continue
+                    out.append({"date": "%04d-%02d-%02dT%02d:%02d:%02d" % date[:6] if date else "",
+                                "subject": _decode_header(msg.get("Subject", "")), "text": text})
+        return out
 
     # ---------- learning ----------
     def _learn(self, m, folders):
@@ -285,6 +316,40 @@ class MailboxSorter:
             m.close()
         return moved, to_learn
 
+    # ---------- серверный спам ----------
+    def _server_spam_notices(self, m, flagged):
+        """Сервер пометил спамом, мы уносим — уведомление пользователю (тема, суть, переписка) с выбором."""
+        for uid, h in flagged:
+            nid = self.store.open_notice(h.sender, h.name, self.login, h.subject, "", h.lu, h.lup)
+            self.store.notice_add_texts(nid, self._fetch_letters(m, [uid], limit=1))
+            log.info("[%s] серверная метка спама: %s — «%s»", self.login, h.sender, h.subject[:80])
+
+    def _notices(self, m, folders):
+        """По каждому новому уведомлению: сколько писем от отправителя в этом ящике и писали ли мы ему."""
+        for n in self.store.pending_notices(self.login):
+            sender = n["sender"]
+            info = {"all": 0, "spam": 0, "sent": 0}
+            for name, raw in folders.items():
+                if name in DEFAULT_SKIP_FOLDERS and (not self.learn or name != self.learn.folder):
+                    continue
+                typ, _ = m.select(_quote(raw), readonly=True)
+                if typ != "OK":
+                    continue
+                if name == SENT_FOLDER:
+                    typ, d = m.uid("SEARCH", None, "TO", _quote(sender))
+                    info["sent"] += len(d[0].split()) if typ == "OK" and d and d[0] else 0
+                else:
+                    typ, d = m.uid("SEARCH", None, "FROM", _quote(sender))
+                    found = d[0].split() if typ == "OK" and d and d[0] else []
+                    mine = [uid for uid, h in self._fetch_headers(m, found).items() if h.sender == sender]
+                    info["all"] += len(mine)
+                    if self.learn and name == self.learn.folder:
+                        info["spam"] += len(mine)
+                    if mine:
+                        self.store.notice_add_texts(n["id"], self._fetch_letters(m, mine))
+                m.close()
+            self.store.notice_progress(n["id"], self.login, info)
+
     # ---------- возврат во входящие ----------
     def _restores(self, m, folders):
         """Кнопка «убрать из фильтра» в боте: письма отправителя из папки правила — обратно во входящие."""
@@ -333,11 +398,15 @@ class MailboxSorter:
                     continue
                 uids, uidvalidity, max_uid = res
                 if uids:
-                    plan = {}
+                    plan, flagged = {}, []
                     for uid, h in self._fetch_headers(m, uids).items():
                         rule = self.pick_rule(h)
                         if rule:
                             plan.setdefault(rule.id or rule.name, (rule, []))[1].append((uid, h.sender))
+                            if rule.unsubscribe and self.by_server_flag(rule, h):
+                                flagged.append((uid, h))
+                    if flagged:
+                        self._server_spam_notices(m, flagged)
                     for rule, items in plan.values():
                         self._move(m, [u for u, _ in items], dest[rule.move_to], rule.mark_read)
                         if rule.id:
@@ -365,6 +434,8 @@ class MailboxSorter:
                     self.state[self.SWEPT_KEY] = sorted(swept | set(fresh))
             if moved_to_learn:
                 self._skip_own_moves(m, folders, moved_to_learn)
+            if self.learn:
+                self._notices(m, folders)   # после переносов — чтобы посчитать и только что пойманное
             if self.learn_folders:
                 self.store.report_progress(self.login, set(self.state.get(self.SWEPT_KEY, [])), self.moved_by_sender)
         finally:

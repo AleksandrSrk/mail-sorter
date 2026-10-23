@@ -14,6 +14,8 @@ from .notifier import Notifier
 from .sorter import MailboxSorter
 from .state import StateStore
 from .unsub import unsubscribe
+from .snippet import summarize_many
+from .views import format_notice, notice_buttons
 
 STOP = False
 
@@ -138,6 +140,21 @@ def send_restores(store, settings, notifier, log):
                       f"{e}\n\n{traceback.format_exc()[-2500:]}")
 
 
+def send_notices(store, settings, notifier, log):
+    """Серверный спам: когда все ящики посчитали письма отправителя — уведомление с выбором."""
+    try:
+        for n in store.ready_notices(list(settings.mailboxes)):
+            n["summary"] = summarize_many(n["texts"]) or n["summary"]
+            n["summarized"] = len([x for x in n["texts"] if x["text"].strip()][:5])
+            if notifier.send(f"notice:{n['id']}", format_notice(n), force=True,
+                             buttons=notice_buttons(n["id"])) or not notifier.enabled:
+                store.mark_notice_sent(n["id"])
+    except Exception as e:
+        log.error("ошибка в уведомлениях о серверном спаме: %s", e)
+        notifier.send(f"err:notice:{type(e).__name__}", "❌ ошибка в уведомлениях о серверном спаме",
+                      f"{e}\n\n{traceback.format_exc()[-2500:]}")
+
+
 def main():
     settings = load_settings()
     setup_logging(settings.data_dir)
@@ -197,6 +214,7 @@ def main():
             process_unsubs(store, settings, notifier, log)
             send_reports(store, settings, notifier, log)
             send_restores(store, settings, notifier, log)
+            send_notices(store, settings, notifier, log)
         heartbeat(settings.data_dir)
         delay = max(5, settings.poll_interval - (time.time() - started))
         while delay > 0 and not STOP:

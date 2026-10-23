@@ -117,3 +117,15 @@ def test_exempt_address_under_blocked_domain(store):
     assert store.pending_restores("box@our.ru")[0]["needle"] == "good@junk.example"
     assert not any(d.startswith("x:ex:") for row in rows for _, d in row)  # второй раз кнопки нет
     assert views.exempt(store, int(rid), "мусор") == (None, "Устаревшая кнопка")
+
+
+def test_not_spam_button_for_server_flagged_sender(store):
+    text, rows = views.check_screen(store, "promo@shop.ru", own_domains={"our.ru"})
+    assert "Ни в одном списке нет." in text and "серверной метке" in text
+    data = rows[0][0][1]
+    assert data.startswith("x:ex:") and rows[0][0][0].startswith("✅ Не спам")
+    (text, rows), _ = views.exempt(store, int(data.split(":")[2]), "promo@shop.ru")
+    assert not store.rules_for("box@our.ru")[0].matches("promo@shop.ru", "", spam_flag=True)
+    assert rows == []
+    _, rows = views.check_screen(store, "boss@our.ru", own_domains={"our.ru"})
+    assert rows == []                                                       # свои — кнопка не нужна
