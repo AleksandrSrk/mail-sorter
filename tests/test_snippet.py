@@ -136,7 +136,7 @@ def test_summarize_correspondence(monkeypatch):
     assert snippet.summarize_correspondence("x@corp.ru", boxes) == ("Договорились о ставке.", None, 2, 0)
     user = seen["body"]["messages"][1]["content"]
     assert user.index("=== Ящик a@our.ru ===") < user.index("=== Ящик b@our.ru ===")
-    assert "[ВХОДЯЩЕЕ, 2026-10-20] Тема: ставка" in user and "[ИСХОДЯЩЕЕ, 2026-10-21] Тема: Re: ставка" in user
+    assert "[ОН → НАМ, 2026-10-20] Тема: ставка" in user and "[МЫ → ЕМУ, 2026-10-21] Тема: Re: ставка" in user
     assert "reasoning_effort" not in seen["body"]                      # только для рассуждающих моделей
     monkeypatch.setenv("LLM_MODEL", "openai/gpt-oss-120b")
 
