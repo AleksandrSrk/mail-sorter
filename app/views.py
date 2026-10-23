@@ -291,10 +291,13 @@ def check_screen(store, addr: str, own_domains=()):
     spam = store.learn_rule()
     if spam and spam["spam_header"] and dom not in own_domains and \
             not any(e["rule_id"] == spam["id"] for e in rows):
-        lines.append("Спам-фильтр может поймать его по серверной метке спама.")
-        data = f"x:ex:{spam['id']}:{addr}"
-        if len(data.encode()) <= 64:
-            buttons.append([("✅ Не спам — не трогать по метке сервера, письма во входящие", data)])
+        if sent:
+            lines.append("🛡 Мы ему писали — серверная метка спама его не трогает.")
+        else:
+            lines.append("Спам-фильтр может поймать его по серверной метке спама.")
+            data = f"x:ex:{spam['id']}:{addr}"
+            if len(data.encode()) <= 64:
+                buttons.append([("✅ Не спам — не трогать по метке сервера, письма во входящие", data)])
     return "\n".join(lines), buttons
 
 

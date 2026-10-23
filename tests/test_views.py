@@ -133,6 +133,10 @@ def test_not_spam_button_for_server_flagged_sender(store):
     assert rows == []
     _, rows = views.check_screen(store, "boss@our.ru", own_domains={"our.ru"})
     assert rows == []                                                       # свои — кнопка не нужна
+    store.add_contacts(["friend@corp.ru"])
+    text, rows = views.check_screen(store, "friend@corp.ru", own_domains={"our.ru"})
+    assert "🛡 Мы ему писали — серверная метка спама его не трогает." in text and "может поймать" not in text
+    assert rows == []                                                       # контакт и так защищён
 
 
 def test_letters_plural():
