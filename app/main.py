@@ -15,7 +15,7 @@ from .sorter import MailboxSorter
 from .state import StateStore
 from .unsub import unsubscribe
 from .snippet import summarize_many
-from .views import format_lookup, format_notice, notice_buttons
+from .views import format_lookup, format_notice, lookup_buttons, notice_buttons
 
 STOP = False
 
@@ -158,8 +158,11 @@ def send_notices(store, settings, notifier, log):
 def send_lookups(store, settings, notifier, log):
     """Отчёт «где его письма» — когда все ящики посмотрели свои папки."""
     try:
+        store.purge_lookup_letters()
         for r in store.ready_lookups(list(settings.mailboxes)):
-            if notifier.send(f"lookup:{r['id']}", format_lookup(r), force=True) or not notifier.enabled:
+            buttons = lookup_buttons(r, settings.own_domains)
+            if notifier.send(f"lookup:{r['id']}", format_lookup(r), force=True, buttons=buttons) \
+                    or not notifier.enabled:
                 store.close_lookup(r["id"])
     except Exception as e:
         log.error("ошибка в отчёте по адресу: %s", e)

@@ -7,10 +7,14 @@ import json
 import logging
 import os
 import re
+import urllib.error
 import urllib.request
 
 log = logging.getLogger("snippet")
 SIGNATURE = re.compile(r"^(--\s*$|с уважением|best regards|kind regards|regards,|отправлено с|sent from)", re.I)
+# начало процитированного письма в ответах (Outlook, веб-почта, телефоны) — дальше старая переписка
+QUOTE_START = re.compile(r"^(-{2,}\s*(original message|исходное сообщение|пересылаемое сообщение|forwarded message)"
+                         r"|(от|from):\s.*@|.*(писал|пишет|wrote)\s*:\s*$)", re.I)
 
 
 def _html_to_text(s: str) -> str:
@@ -52,7 +56,7 @@ def short(text: str, limit=300) -> str:
         line = line.strip()
         if line.startswith(">"):
             continue
-        if SIGNATURE.match(line):
+        if SIGNATURE.match(line) or QUOTE_START.match(line):
             break
         if line:
             lines.append(line)
@@ -62,23 +66,36 @@ def short(text: str, limit=300) -> str:
     return out if len(out) <= limit else out[:limit].rsplit(" ", 1)[0] + "…"
 
 
-def _llm(system: str, user: str):
+LLM_ERRORS = {401: "ключ Groq не принят (401)", 413: "запрос слишком большой для лимита (413)",
+              429: "упёрлись в лимит Groq (429) — попробуй через минуту"}
+
+
+def _llm_call(system: str, user: str, max_tokens=300, limit=800):
+    """-> (текст, None) или (None, причина по-человечески)."""
     key = os.environ.get("LLM_API_KEY", "").strip()
     if not key:
-        return None
+        return None, "не задан LLM_API_KEY"
     url = os.environ.get("LLM_API_URL", "https://api.x.ai/v1/chat/completions")
     model = os.environ.get("LLM_MODEL", "grok-3-mini")
-    body = {"model": model, "temperature": 0.2, "max_tokens": 300,
+    body = {"model": model, "temperature": 0.2, "max_tokens": max_tokens,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
     try:
         req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
                                      headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
                                               "User-Agent": "mail-sorter/1.0"})  # Cloudflare режет Python-urllib
-        with urllib.request.urlopen(req, timeout=40) as r:
-            return json.load(r)["choices"][0]["message"]["content"].strip()[:800] or None
+        with urllib.request.urlopen(req, timeout=60) as r:
+            text = (json.load(r)["choices"][0]["message"].get("content") or "").strip()[:limit]
+            return (text, None) if text else (None, "пустой ответ модели")
+    except urllib.error.HTTPError as e:
+        why = LLM_ERRORS.get(e.code, f"ошибка API {e.code}")
     except Exception as e:
-        log.warning("LLM-пересказ не удался (%s), беру начало текста", type(e).__name__)
-        return None
+        why = f"нет ответа ({type(e).__name__})"
+    log.warning("LLM не ответила: %s", why)
+    return None, why
+
+
+def _llm(system: str, user: str):
+    return _llm_call(system, user)[0]
 
 
 def summarize(subject: str, text: str) -> str:
@@ -101,3 +118,42 @@ def summarize_many(letters, limit=5) -> str:
     got = _llm("Ниже несколько писем от одного отправителя. Сделай по-русски общую сводку в 2–3 предложениях: "
                "кто пишет, о чём эти письма и чего от нас хотят. Без вступлений и оценок.", user)
     return got or f"{short(letters[0]['text'])} (всего писем для сводки: {len(letters)})"
+
+
+CORRESPONDENCE_PROMPT = (
+    "Ты помогаешь директору транспортной компании. Ниже переписка нашей компании с одним внешним адресом, "
+    "сгруппированная по нашим почтовым ящикам: «от него» — его письма нам, «от нас» — наши ему. "
+    "Напиши по-русски кратко: кто это и чем занимается; по каждому ящику — о чём переписка и на чём остановились; "
+    "чего он от нас хочет или ждёт. Если переписки по сути нет (только рассылки), так и скажи. "
+    "Без вступлений, без оценок, не выдумывай того, чего нет в письмах. До 8 предложений.")
+
+
+def fit_letters(boxes: dict, budget=12000, per_letter=600, floor=200):
+    """Укладываем письма в бюджет символов (≈ лимит токенов Groq): сначала укорачиваем каждое письмо
+    до floor, потом выкидываем самые старые. -> (список (ящик, письмо, текст), выкинуто писем)."""
+    items = [(mb, x) for mb, xs in boxes.items() for x in xs if (x.get("text") or "").strip()]
+    items.sort(key=lambda it: it[1].get("date", ""), reverse=True)
+    limit = per_letter
+    while limit > floor and sum(min(len(x["text"]), limit) + len(x.get("subject", "")) + 40 for _, x in items) > budget:
+        limit -= 100
+    dropped = 0
+    while items and sum(min(len(x["text"]), limit) + len(x.get("subject", "")) + 40 for _, x in items) > budget:
+        items.pop()
+        dropped += 1
+    return [(mb, x, short(x["text"], limit)) for mb, x, in items], dropped
+
+
+def summarize_correspondence(address: str, boxes: dict, budget=12000):
+    """boxes: {ящик: [{"dir": "in"|"out", "date", "subject", "text"}]} -> (текст | None, ошибка | None, писем, выкинуто)."""
+    items, dropped = fit_letters(boxes, budget)
+    if not items:
+        return None, "текстов писем нет", 0, 0
+    parts = []
+    for mb in sorted({mb for mb, _, _ in items}):
+        parts.append(f"=== Ящик {mb} ===")
+        for _, x, text in sorted((it for it in items if it[0] == mb), key=lambda it: it[1].get("date", "")):
+            who = "от него" if x.get("dir") == "in" else "от нас"
+            parts.append(f"[{who}, {x.get('date', '')[:10]}] Тема: {x.get('subject', '')}\n{text}")
+    text, err = _llm_call(CORRESPONDENCE_PROMPT, f"Адрес: {address}\n\n" + "\n\n".join(parts),
+                          max_tokens=900, limit=3000)
+    return text, err, len(items), dropped

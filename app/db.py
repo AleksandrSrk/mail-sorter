@@ -69,8 +69,10 @@ CREATE TABLE IF NOT EXISTS contact_boxes(
 CREATE TABLE IF NOT EXISTS lookups(
     id INTEGER PRIMARY KEY,
     address TEXT NOT NULL,        -- «где его письма» — запрос из проверки адреса в боте
-    boxes TEXT NOT NULL DEFAULT '{}',  -- {ящик: {"folders": {папка: писем от него}, "sent": наших ему, даты}}
-    created_at TEXT, sent_at TEXT
+    boxes TEXT NOT NULL DEFAULT '{}',  -- {ящик: {"folders": {папка: писем}, "sent": наших ему, даты, letters}}
+    created_at TEXT, sent_at TEXT,
+    decision TEXT, decided_at TEXT,    -- кнопки под отчётом: spam / ham
+    ai_at TEXT                         -- когда спрашивали нейронку
 );
 CREATE TABLE IF NOT EXISTS reports(
     id INTEGER PRIMARY KEY,
@@ -132,6 +134,10 @@ class Store:
             self.x("ALTER TABLE reports ADD COLUMN rule_id INTEGER")
         if "texts" not in {r["name"] for r in self.q("PRAGMA table_info(notices)")}:
             self.x("ALTER TABLE notices ADD COLUMN texts TEXT NOT NULL DEFAULT '[]'")
+        cols = {r["name"] for r in self.q("PRAGMA table_info(lookups)")}
+        for col in ("decision", "decided_at", "ai_at"):
+            if col not in cols:
+                self.x(f"ALTER TABLE lookups ADD COLUMN {col} TEXT")
 
     def q(self, sql, *args):
         return self.db.execute(sql, args).fetchall()
@@ -448,6 +454,46 @@ class Store:
 
     def close_lookup(self, lookup_id, now=None):
         self.x("UPDATE lookups SET sent_at=? WHERE id=?", now_iso(now), lookup_id)
+
+    def get_lookup(self, lookup_id):
+        r = self.one("SELECT * FROM lookups WHERE id=?", lookup_id)
+        return dict(r, boxes=json.loads(r["boxes"])) if r else None
+
+    def mark_lookup_ai(self, lookup_id, now=None):
+        self.x("UPDATE lookups SET ai_at=? WHERE id=?", now_iso(now), lookup_id)
+
+    def purge_lookup_letters(self, days=3, now=None):
+        """Тексты писем держим только пару дней — для кнопки «сводка нейронкой», дальше не копим переписку."""
+        edge = now_iso((now or datetime.now(timezone.utc)) - timedelta(days=days))
+        for r in self.q("SELECT id, boxes FROM lookups WHERE created_at < ? AND boxes LIKE '%\"letters\"%'", edge):
+            boxes = json.loads(r["boxes"])
+            for info in boxes.values():
+                info.pop("letters", None)
+            self.x("UPDATE lookups SET boxes=? WHERE id=?", json.dumps(boxes, ensure_ascii=False), r["id"])
+
+    def decide_lookup(self, lookup_id, decision, now=None):
+        """Кнопки под отчётом «где его письма». spam — как ручной перенос в спам во всех ящиках, где есть его
+        письма (с отпиской); ham — исключение от спам-фильтра и серверной метки + возврат во входящие."""
+        r = self.get_lookup(lookup_id)
+        if not r or r["decision"]:
+            return r, None
+        rule = self.learn_rule()
+        if not rule:
+            return r, None
+        addr = r["address"]
+        self.x("UPDATE lookups SET decision=?, decided_at=? WHERE id=?", decision, now_iso(now), lookup_id)
+        if decision == "spam":
+            boxes = sorted(r["boxes"].items(), key=lambda x: -sum(x[1].get("folders", {}).values()))
+            action = None
+            for mb, info in boxes:
+                if info.get("folders"):
+                    action = self.learn(addr, mb, info.get("lu", ""), info.get("lup", ""), now=now) or action
+            if not any(info.get("folders") for _, info in boxes):
+                action = self.learn(addr, "", now=now)
+            self.open_report(addr, boxes[0][0] if boxes else "", action or "added", rule_id=rule["id"], now=now)
+        else:
+            self.queue_restore(self.add_entry(rule["id"], "addr", addr, "bot"), now=now)
+        return self.get_lookup(lookup_id), decision
 
     # ---------- contacts (для оценки полезности) ----------
     def add_contacts(self, addresses):

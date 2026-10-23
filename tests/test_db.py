@@ -124,3 +124,25 @@ def test_migration_of_old_db(tmp_path):
     assert [r["name"] for r in s.learn_rules("a@b.ru")] == ["Спам"]
     s.open_report("x@y.ru", "a@b.ru", "added")
     assert s.one("SELECT rule_id FROM reports")["rule_id"] == s.learn_rule()["id"]
+
+
+def test_lookup_letters_purged_and_old_schema_migrated(store, tmp_path):
+    old = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    lid = store.queue_lookup("a@b.ru", now=old)
+    store.lookup_progress(lid, "x@our.ru", {"folders": {"INBOX": 1}, "sent": 0, "letters": [{"text": "секрет"}]})
+    fresh = store.queue_lookup("c@d.ru")
+    store.lookup_progress(fresh, "x@our.ru", {"folders": {}, "sent": 0, "letters": [{"text": "свежее"}]})
+    store.purge_lookup_letters(days=3)
+    assert "letters" not in store.get_lookup(lid)["boxes"]["x@our.ru"]
+    assert store.get_lookup(lid)["boxes"]["x@our.ru"]["folders"] == {"INBOX": 1}   # цифры остаются
+    assert store.get_lookup(fresh)["boxes"]["x@our.ru"]["letters"]
+
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE lookups(id INTEGER PRIMARY KEY, address TEXT NOT NULL, "
+               "boxes TEXT NOT NULL DEFAULT '{}', created_at TEXT, sent_at TEXT)")
+    db.commit()
+    db.close()
+    s2 = Store(path)
+    assert {"decision", "decided_at", "ai_at"} <= {r["name"] for r in s2.q("PRAGMA table_info(lookups)")}

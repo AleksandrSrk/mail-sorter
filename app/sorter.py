@@ -9,7 +9,7 @@ from collections import Counter, namedtuple
 
 from . import imap_utf7
 from .config import DEFAULT_SKIP_FOLDERS, LearnSpam, Rule
-from .snippet import body_text
+from .snippet import body_text, short
 
 log = logging.getLogger("sorter")
 LIST_RE = re.compile(rb'\((?P<flags>.*?)\) "(?P<sep>.)" (?P<name>.*)')
@@ -384,11 +384,15 @@ class MailboxSorter:
             self.store.notice_progress(n["id"], self.login, info)
 
     # ---------- «где его письма» ----------
+    LOOKUP_LETTERS = 5      # последних его и наших писем с ящика — для сводки нейронкой по кнопке
+
     def _lookups(self, m, folders):
-        """Запрос из проверки адреса: сколько его писем в каждой папке ящика и сколько мы ему отправили."""
+        """Запрос из проверки адреса: сколько его писем в каждой папке ящика и сколько мы ему отправили.
+        Заодно тексты последних писем (без цитат, подписей и вложений) — нейронка получит их только по кнопке."""
         for job in self.store.pending_lookups(self.login):
             addr = job["address"]
-            info = {"folders": {}, "sent": 0, "first": "", "last": "", "last_sent": ""}
+            info = {"folders": {}, "sent": 0, "first": "", "last": "", "last_sent": "", "lu": "", "lup": ""}
+            got, ours = [], []
             for name, raw in folders.items():
                 typ, _ = m.select(_quote(raw), readonly=True)
                 if typ != "OK":
@@ -400,16 +404,25 @@ class MailboxSorter:
                     if mine:
                         info["sent"] += len(mine)
                         info["last_sent"] = max(info["last_sent"], self._dates(m, mine)[1])
+                        ours += self._fetch_letters(m, mine, limit=self.LOOKUP_LETTERS)
                 else:
                     typ, d = m.uid("SEARCH", None, "FROM", _quote(addr))
                     found = d[0].split() if typ == "OK" and d and d[0] else []
-                    mine = [u for u, h in self._fetch_headers(m, found).items() if h.sender == addr]
+                    hdrs = {u: h for u, h in self._fetch_headers(m, found).items() if h.sender == addr}
+                    mine = list(hdrs)
                     if mine:
+                        newest = hdrs[max(mine, key=int)]
+                        if newest.lu and not info["lu"]:      # для отписки, если нажмут «В спам»
+                            info["lu"], info["lup"] = newest.lu, newest.lup
+                        got += self._fetch_letters(m, mine, limit=self.LOOKUP_LETTERS)
                         info["folders"][name] = len(mine)
                         first, last = self._dates(m, mine)
                         info["first"] = min(filter(None, [info["first"], first]), default="")
                         info["last"] = max(info["last"], last)
                 m.close()
+            newest = lambda xs: sorted(xs, key=lambda x: x["date"], reverse=True)[:self.LOOKUP_LETTERS]  # noqa: E731
+            info["letters"] = [{"dir": d, "date": x["date"], "subject": x["subject"][:200], "text": short(x["text"], 1500)}
+                               for d, xs in (("in", got), ("out", ours)) for x in newest(xs)]
             self.store.lookup_progress(job["id"], self.login, info)
 
     # ---------- возврат во входящие ----------

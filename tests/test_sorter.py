@@ -319,5 +319,21 @@ def test_lookup_counts_folders_sent_and_dates(store):
     assert info["folders"] == {"INBOX": 2, "Archive": 1}               # xpartner@ не считается
     assert info["sent"] == 1 and info["last_sent"] == "2026-10-04"
     assert (info["first"], info["last"]) == ("2026-10-02", "2026-10-09")
+    letters = info["letters"]
+    assert [(x["dir"], x["subject"]) for x in letters] == [("in", "Акт"), ("in", "Счёт"), ("in", "Старое"),
+                                                            ("out", "partner@corp.ru")]   # свежие первыми, чужие нет
+    assert letters[0]["text"] == "Текст письма от partner@corp.ru: предлагаем услуги."  # подпись отрезана
     s.run_once()
     assert store.pending_lookups("me@our.ru") == []                     # ящик отчитался — больше не ищет
+
+
+def test_lookup_keeps_five_newest_and_unsubscribe_header(store):
+    msgs = {u: ("bulk@shop.ru", f"Письмо {u}", False, f"<mailto:u{u}@shop.ru>") for u in range(1, 9)}
+    fake = FakeIMAP({"INBOX": {"validity": 1, "msgs": dict(msgs)}})
+    s = make(fake, store)
+    s.run_once(full=True)
+    store.queue_lookup("bulk@shop.ru")
+    s.run_once()
+    info = store.ready_lookups(["me@our.ru"])[0]["boxes"]["me@our.ru"]
+    assert [x["subject"] for x in info["letters"]] == [f"Письмо {u}" for u in (8, 7, 6, 5, 4)]
+    assert info["lu"] == "<mailto:u8@shop.ru>"                         # из самого свежего письма

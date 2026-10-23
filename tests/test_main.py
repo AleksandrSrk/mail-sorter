@@ -187,8 +187,9 @@ def test_lookup_report_after_all_boxes(store):
     store.queue_lookup("partner@corp.ru")
     sent = []
     notifier = SimpleNamespace(enabled=True, send=lambda key, subj, body="", force=False, buttons=None:
-                               sent.append(subj) or True)
-    settings = SimpleNamespace(mailboxes={"a@our.ru": 1, "b@our.ru": 1})
+                               sent.append(subj) or bts.append(buttons) or True)
+    bts = []
+    settings = SimpleNamespace(mailboxes={"a@our.ru": 1, "b@our.ru": 1}, own_domains={"our.ru"})
     a.run_once()
     main.send_lookups(store, settings, notifier, logging.getLogger("t"))
     assert sent == []                                         # ждём второй ящик
@@ -196,5 +197,53 @@ def test_lookup_report_after_all_boxes(store):
     main.send_lookups(store, settings, notifier, logging.getLogger("t"))
     assert len(sent) == 1 and "📬 a@our.ru: от него 1, от нас 1\n  • Входящие — 1" in sent[0]
     assert "В остальных ящиках (1) ничего." in sent[0]
+    assert [d for row in bts[0] for _, d in row] == ["l:ai:1:0", "l:spam:1:0", "l:ham:1:0"]
     main.send_lookups(store, settings, notifier, logging.getLogger("t"))
     assert len(sent) == 1
+
+
+def test_lookup_spam_button_learns_everywhere_and_unsubscribes(store, monkeypatch):
+    from app import views
+    (a, fa), (b, fb) = _boxes(store, [
+        ("a@our.ru", {"INBOX": {"validity": 1, "msgs": {1: ("promo@shop.ru", "Скидки", False, "<mailto:u@shop.ru>")}},
+                      "Junk": {"validity": 1, "msgs": {}}}),
+        ("b@our.ru", {"INBOX": {"validity": 1, "msgs": {}},
+                      "Archive": {"validity": 1, "msgs": {1: ("promo@shop.ru", "Старое", False, "<mailto:v@shop.ru>")}},
+                      "Junk": {"validity": 1, "msgs": {}}}),
+    ])
+    a.run_once(full=True)
+    b.run_once(full=True)
+    lid = store.queue_lookup("promo@shop.ru")
+    a.run_once()
+    b.run_once()
+    line, note, rows = views.lookup_action(store, f"l:spam:{lid}:0", own_domains={"our.ru"})
+    assert line.startswith("🚫 Решение: спам") and rows == [[("🧠 Сводка нейронкой", f"l:ai:{lid}:0")]]
+    assert sorted((u["mailbox"], u["header"]) for u in store.pending_unsubs()) == [
+        ("a@our.ru", "<mailto:u@shop.ru>"), ("b@our.ru", "<mailto:v@shop.ru>")]   # отписка в каждом ящике
+    assert views.lookup_action(store, f"l:ham:{lid}:0")[1] == "Уже решено"
+    a.run_once()
+    b.run_once()
+    assert fa.f["INBOX"]["msgs"] == {} and fb.f["Archive"]["msgs"] == {}         # унесли в спам везде
+    assert [m[0] for m in fb.f["Junk"]["msgs"].values()] == ["promo@shop.ru"]
+
+
+def test_lookup_ham_button_returns_from_spam(store):
+    from app import views
+    store.add_contacts(["partner@corp.ru"])
+    (a, fa), = _boxes(store, [
+        ("a@our.ru", {"INBOX": {"validity": 1, "msgs": {}},
+                      "Junk": {"validity": 1, "msgs": {1: ("partner@corp.ru", "Счёт", True)}},
+                      "Отправленные": {"validity": 1, "msgs": {1: ("me@our.ru", "partner@corp.ru", False)}}}),
+    ])
+    a.run_once(full=True)
+    lid = store.queue_lookup("partner@corp.ru")
+    a.run_once()
+    _, note, rows = views.lookup_action(store, f"l:spam:{lid}:0", own_domains={"our.ru"})
+    assert note == "Мы ему писали — подтверди" and rows[0][0][1] == f"l:spam!:{lid}:0"
+    _, note, rows = views.lookup_action(store, f"l:back:{lid}:0", own_domains={"our.ru"})
+    assert note == "Отменено" and [d for _, d in rows[-1]] == [f"l:spam:{lid}:0", f"l:ham:{lid}:0"]
+    line, _, _ = views.lookup_action(store, f"l:ham:{lid}:0", own_domains={"our.ru"})
+    assert line.startswith("✅ Решение: не спам")
+    a.run_once()
+    assert [m[0] for m in fa.f["INBOX"]["msgs"].values()] == ["partner@corp.ru"]
+    assert fa.f["Junk"]["msgs"] == {}

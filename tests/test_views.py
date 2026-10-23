@@ -159,3 +159,24 @@ def test_check_queues_lookup_and_report_text(store):
     assert "В остальных ящиках (1) ничего." in t and "Не проверены (ящик недоступен): c@our.ru" in t
     empty = views.format_lookup({"address": "x@y.ru", "missing": [], "boxes": {"a@our.ru": r["boxes"]["b@our.ru"]}})
     assert "Ни в одном ящике писем от него и к нему нет." in empty
+
+
+def test_lookup_buttons_and_ai(store, monkeypatch):
+    lid = store.queue_lookup("partner@corp.ru")
+    store.lookup_progress(lid, "a@our.ru", {"folders": {"INBOX": 1}, "sent": 0, "letters": [
+        {"dir": "in", "date": "2026-10-20", "subject": "ставка", "text": "Предлагаем 1500."}]})
+    r = store.get_lookup(lid)
+    assert [d for row in views.lookup_buttons(r, {"our.ru"}) for _, d in row] == [
+        f"l:ai:{lid}:0", f"l:spam:{lid}:0", f"l:ham:{lid}:0"]
+    own = dict(r, address="boss@our.ru")
+    assert [d for row in views.lookup_buttons(own, {"our.ru"}) for _, d in row] == [f"l:ai:{lid}:0", f"l:ham:{lid}:0"]
+    monkeypatch.setattr(views, "summarize_correspondence", lambda addr, boxes: (None, "упёрлись в лимит Groq (429)", 1, 0))
+    assert views.lookup_ai(store, lid) == ("🧠 partner@corp.ru: нейронка не ответила — упёрлись в лимит Groq (429). "
+                                           "Цифры в отчёте выше актуальны.")
+    assert views.lookup_buttons(store.get_lookup(lid))[0][0][1] == f"l:ai:{lid}:0"   # можно повторить
+    monkeypatch.setattr(views, "summarize_correspondence", lambda addr, boxes: ("Предлагает вагоны.", None, 1, 2))
+    assert views.lookup_ai(store, lid) == ("🧠 partner@corp.ru — сводка нейронкой (писем: 1, ещё 2 не влезли в лимит)"
+                                           "\n\nПредлагает вагоны.")
+    assert [d for row in views.lookup_buttons(store.get_lookup(lid)) for _, d in row] == [
+        f"l:spam:{lid}:0", f"l:ham:{lid}:0"]                              # нейронку второй раз не жжём
+    assert views.lookup_action(store, "l:spam:x:0")[1] == "Устаревшая кнопка"

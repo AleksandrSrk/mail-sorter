@@ -95,6 +95,35 @@ def build_router(store: Store, admin_id: int, own_domains=()) -> Router:
                 pass
         await c.answer(note)
 
+    @r.callback_query(F.data.startswith("l:ai:"))
+    async def lookup_ai(c: CallbackQuery):
+        try:
+            ident = int(c.data.split(":")[2])
+        except ValueError:
+            await c.answer("Устаревшая кнопка")
+            return
+        await c.answer("Спрашиваю нейронку…")
+        text = await asyncio.to_thread(views.lookup_ai, store, ident)
+        await c.message.reply(text[:4000])
+        r = store.get_lookup(ident)
+        if r:
+            try:
+                await c.message.edit_reply_markup(reply_markup=markup(views.lookup_buttons(r, own_domains)))
+            except TelegramBadRequest:
+                pass
+
+    @r.callback_query(F.data.startswith("l:"))
+    async def lookup_decision(c: CallbackQuery):
+        result, note, rows = views.lookup_action(store, c.data, own_domains)
+        try:
+            if result:
+                await c.message.edit_text(f"{c.message.text}\n\n{result}"[:4000], reply_markup=markup(rows))
+            elif rows is not None:
+                await c.message.edit_reply_markup(reply_markup=markup(rows))
+        except TelegramBadRequest:
+            pass
+        await c.answer(note)
+
     @r.callback_query(F.data == "noop")
     async def noop(c: CallbackQuery):
         await c.answer()

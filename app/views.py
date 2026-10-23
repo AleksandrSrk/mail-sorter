@@ -5,8 +5,9 @@ callback_data: "<список>:<действие>:<id>:<страница>"  (л�
 import re
 from math import ceil
 
-from .db import IN_FILTER, Store, now_iso
+from .db import IN_FILTER, Store, domain_of, now_iso
 from .scoring import FREE, SUSPICIOUS, score_addr, score_domain
+from .snippet import summarize_correspondence
 
 PAGE = 10
 STATUS = {
@@ -377,6 +378,73 @@ def format_lookup(r) -> str:
     if r.get("missing"):
         lines.append("⚠️ Не проверены (ящик недоступен): " + ", ".join(r["missing"]))
     return "\n".join(lines)
+
+
+def _has_letters(r) -> bool:
+    return any(i.get("letters") for i in r["boxes"].values())
+
+
+def lookup_buttons(r, own_domains=(), confirm=False):
+    """Кнопки под отчётом «где его письма»: сводка нейронкой (один раз) и решение спам / не спам (одно)."""
+    rid = r["id"]
+    if confirm:
+        return [[("⚠️ Да, мы ему писали, но всё равно в спам", f"l:spam!:{rid}:0")], [("Отмена", f"l:back:{rid}:0")]]
+    rows = []
+    if not r.get("ai_at") and _has_letters(r):
+        rows.append([("🧠 Сводка нейронкой", f"l:ai:{rid}:0")])
+    if not r.get("decision"):
+        row = []
+        if domain_of(r["address"]) not in own_domains:
+            row.append(("🚫 В спам", f"l:spam:{rid}:0"))
+        row.append(("✅ Не спам → во входящие", f"l:ham:{rid}:0"))
+        rows.append(row)
+    return rows
+
+
+def lookup_action(store, data: str, own_domains=()):
+    """Спам / не спам под отчётом. -> (строка-итог к сообщению | None, короткий ответ, новые кнопки | None)"""
+    try:
+        _, action, ident, _ = data.split(":")
+        ident = int(ident)
+    except ValueError:
+        return None, "Устаревшая кнопка", None
+    r = store.get_lookup(ident)
+    if not r:
+        return None, "Отчёт не найден", None
+    if r["decision"]:
+        return None, "Уже решено", lookup_buttons(r, own_domains)
+    if action == "back":
+        return None, "Отменено", lookup_buttons(r, own_domains)
+    if action in ("spam", "spam!"):
+        if domain_of(r["address"]) in own_domains:
+            return None, "Свой домен в спам не отправляю", lookup_buttons(r, own_domains)
+        if action == "spam" and sum(i.get("sent", 0) for i in r["boxes"].values()):
+            return None, "Мы ему писали — подтверди", lookup_buttons(r, own_domains, confirm=True)
+        r, _ = store.decide_lookup(ident, "spam")
+        return ("🚫 Решение: спам. Его письма во всех ящиках уйдут в спам, попробую отписаться от рассылки. "
+                "Сводка придёт отдельным сообщением.", "В спам", lookup_buttons(r, own_domains))
+    if action == "ham":
+        r, _ = store.decide_lookup(ident, "ham")
+        return ("✅ Решение: не спам. Спам-фильтр и серверная метка его больше не трогают, письма из спама "
+                "во всех ящиках вернутся во входящие. Сводка придёт отдельным сообщением.", "Не спам",
+                lookup_buttons(r, own_domains))
+    return None, "Устаревшая кнопка", None
+
+
+def lookup_ai(store, lookup_id: int) -> str:
+    """Кнопка «🧠 Сводка нейронкой»: тексты последних писем по всем ящикам -> LLM. Возвращает текст сообщения."""
+    r = store.get_lookup(lookup_id)
+    if not r:
+        return "Отчёт не найден."
+    boxes = {mb: i["letters"] for mb, i in r["boxes"].items() if i.get("letters")}
+    if not boxes:
+        return "🧠 Текстов писем уже нет (храню пару дней) — пришли адрес ещё раз, соберу заново."
+    text, err, used, dropped = summarize_correspondence(r["address"], boxes)
+    if not text:
+        return f"🧠 {r['address']}: нейронка не ответила — {err}. Цифры в отчёте выше актуальны."
+    store.mark_lookup_ai(lookup_id)
+    tail = f", ещё {dropped} не влезли в лимит" if dropped else ""
+    return f"🧠 {r['address']} — сводка нейронкой (писем: {used}{tail})\n\n{text}"
 
 
 def format_notice(n) -> str:
