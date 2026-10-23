@@ -79,13 +79,20 @@ def _llm_call(system: str, user: str, max_tokens=300, limit=800):
     model = os.environ.get("LLM_MODEL", "grok-3-mini")
     body = {"model": model, "temperature": 0.2, "max_tokens": max_tokens,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    if "gpt-oss" in model:      # рассуждающая модель: «мысли» едят тот же лимит токенов, что и ответ
+        body["reasoning_effort"] = "low"
     try:
         req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
                                      headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
                                               "User-Agent": "mail-sorter/1.0"})  # Cloudflare режет Python-urllib
         with urllib.request.urlopen(req, timeout=60) as r:
-            text = (json.load(r)["choices"][0]["message"].get("content") or "").strip()[:limit]
-            return (text, None) if text else (None, "пустой ответ модели")
+            choice = json.load(r)["choices"][0]
+        text = (choice["message"].get("content") or "").strip()[:limit]
+        if not text:
+            return None, "пустой ответ модели"
+        if choice.get("finish_reason") == "length":
+            text += "\n\n(ответ обрезан — не хватило лимита токенов)"
+        return text, None
     except urllib.error.HTTPError as e:
         why = LLM_ERRORS.get(e.code, f"ошибка API {e.code}")
     except Exception as e:
@@ -121,11 +128,14 @@ def summarize_many(letters, limit=5) -> str:
 
 
 CORRESPONDENCE_PROMPT = (
-    "Ты помогаешь директору транспортной компании. Ниже переписка нашей компании с одним внешним адресом, "
-    "сгруппированная по нашим почтовым ящикам: «от него» — его письма нам, «от нас» — наши ему. "
-    "Напиши по-русски кратко: кто это и чем занимается; по каждому ящику — о чём переписка и на чём остановились; "
-    "чего он от нас хочет или ждёт. Если переписки по сути нет (только рассылки), так и скажи. "
-    "Без вступлений, без оценок, не выдумывай того, чего нет в письмах. До 8 предложений.")
+    "Ты помогаешь директору транспортной компании понять, кто такой внешний адрес и что у нас с ним. "
+    "Ниже письма, сгруппированные по нашим почтовым ящикам. ВХОДЯЩЕЕ — он написал нам, ИСХОДЯЩЕЕ — мы написали ему; "
+    "не путай направление. Ответ по-русски, простым текстом без markdown и звёздочек, строго по форме:\n"
+    "Кто это: одно предложение.\n"
+    "По ящикам: для каждого ящика одна строка «ящик — о чём письма, кто что просил, на чём остановились».\n"
+    "Что от нас хотят: одно-два предложения (или «ничего, только рассылка»).\n"
+    "Вывод: живая переписка, рассылка или похоже на спам — и коротко почему.\n"
+    "Опирайся только на текст писем, не выдумывай.")
 
 
 def fit_letters(boxes: dict, budget=12000, per_letter=600, floor=200):
@@ -143,7 +153,7 @@ def fit_letters(boxes: dict, budget=12000, per_letter=600, floor=200):
     return [(mb, x, short(x["text"], limit)) for mb, x, in items], dropped
 
 
-def summarize_correspondence(address: str, boxes: dict, budget=12000):
+def summarize_correspondence(address: str, boxes: dict, budget=10000):
     """boxes: {ящик: [{"dir": "in"|"out", "date", "subject", "text"}]} -> (текст | None, ошибка | None, писем, выкинуто)."""
     items, dropped = fit_letters(boxes, budget)
     if not items:
@@ -152,8 +162,8 @@ def summarize_correspondence(address: str, boxes: dict, budget=12000):
     for mb in sorted({mb for mb, _, _ in items}):
         parts.append(f"=== Ящик {mb} ===")
         for _, x, text in sorted((it for it in items if it[0] == mb), key=lambda it: it[1].get("date", "")):
-            who = "от него" if x.get("dir") == "in" else "от нас"
+            who = "ВХОДЯЩЕЕ" if x.get("dir") == "in" else "ИСХОДЯЩЕЕ"
             parts.append(f"[{who}, {x.get('date', '')[:10]}] Тема: {x.get('subject', '')}\n{text}")
     text, err = _llm_call(CORRESPONDENCE_PROMPT, f"Адрес: {address}\n\n" + "\n\n".join(parts),
-                          max_tokens=900, limit=3000)
+                          max_tokens=2000, limit=3500)
     return text, err, len(items), dropped

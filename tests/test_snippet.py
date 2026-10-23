@@ -136,7 +136,23 @@ def test_summarize_correspondence(monkeypatch):
     assert snippet.summarize_correspondence("x@corp.ru", boxes) == ("Договорились о ставке.", None, 2, 0)
     user = seen["body"]["messages"][1]["content"]
     assert user.index("=== Ящик a@our.ru ===") < user.index("=== Ящик b@our.ru ===")
-    assert "[от него, 2026-10-20] Тема: ставка" in user and "[от нас, 2026-10-21] Тема: Re: ставка" in user
+    assert "[ВХОДЯЩЕЕ, 2026-10-20] Тема: ставка" in user and "[ИСХОДЯЩЕЕ, 2026-10-21] Тема: Re: ставка" in user
+    assert "reasoning_effort" not in seen["body"]                      # только для рассуждающих моделей
+    monkeypatch.setenv("LLM_MODEL", "openai/gpt-oss-120b")
+
+    class Cut(Resp):
+        def read(self):
+            return json.dumps({"choices": [{"message": {"content": "Кто это: продавец"},
+                                            "finish_reason": "length"}]}).encode()
+
+    def cut_urlopen(req, timeout):
+        seen["body"] = json.loads(req.data)
+        return Cut()
+
+    monkeypatch.setattr(snippet.urllib.request, "urlopen", cut_urlopen)
+    text, err, _, _ = snippet.summarize_correspondence("x@corp.ru", boxes)
+    assert seen["body"]["reasoning_effort"] == "low" and seen["body"]["max_tokens"] == 2000
+    assert text == "Кто это: продавец\n\n(ответ обрезан — не хватило лимита токенов)" and err is None
 
     def limited(req, timeout):
         raise snippet.urllib.error.HTTPError(req.full_url, 429, "Too Many", {}, None)
