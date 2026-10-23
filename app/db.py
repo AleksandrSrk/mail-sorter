@@ -69,6 +69,15 @@ CREATE TABLE IF NOT EXISTS reports(
     boxes TEXT NOT NULL DEFAULT '{}',  -- {ящик: сколько старых писем перенесено}
     created_at TEXT, done_at TEXT
 );
+CREATE TABLE IF NOT EXISTS restores(
+    id INTEGER PRIMARY KEY,
+    entry_id INTEGER NOT NULL,
+    needle TEXT NOT NULL,         -- адрес или @домен
+    folder TEXT NOT NULL,         -- папка правила, откуда возвращаем
+    rule_name TEXT, rule_mailbox TEXT,
+    boxes TEXT NOT NULL DEFAULT '{}',  -- {ящик: сколько писем вернули во входящие}
+    created_at TEXT, done_at TEXT
+);
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -275,6 +284,48 @@ class Store:
 
     def close_report(self, report_id, now=None):
         self.x("UPDATE reports SET done_at=? WHERE id=?", now_iso(now), report_id)
+
+    # ---------- возврат писем во входящие (кнопка в боте) ----------
+    def queue_restore(self, entry_id, now=None):
+        """Снять запись с правила и поставить в очередь возврат её писем во входящие."""
+        e = self.one("SELECT e.*, r.name AS rule_name, r.move_to, r.mailbox AS rmb FROM entries e "
+                     "JOIN rules r ON r.id=e.rule_id WHERE e.id=?", entry_id)
+        if not e:
+            return None
+        ts = now_iso(now)
+        self.x("UPDATE entries SET status='removed', hidden=0, updated_at=? WHERE id=?", ts, entry_id)
+        needle = e["value"] if e["kind"] == "addr" else "@" + e["value"]
+        if not self.one("SELECT 1 FROM restores WHERE entry_id=? AND done_at IS NULL", entry_id):
+            self.x("INSERT INTO restores(entry_id, needle, folder, rule_name, rule_mailbox, created_at) "
+                   "VALUES(?,?,?,?,?,?)", entry_id, needle, e["move_to"], e["rule_name"], e["rmb"], ts)
+        return e
+
+    def pending_restores(self, mailbox):
+        out = []
+        for r in self.q("SELECT * FROM restores WHERE done_at IS NULL AND rule_mailbox IN ('*', ?)", mailbox):
+            if mailbox not in json.loads(r["boxes"]):
+                out.append(r)
+        return out
+
+    def restore_progress(self, restore_id, mailbox, n):
+        r = self.one("SELECT boxes FROM restores WHERE id=?", restore_id)
+        boxes = json.loads(r["boxes"])
+        boxes[mailbox] = n
+        self.x("UPDATE restores SET boxes=? WHERE id=?", json.dumps(boxes, ensure_ascii=False), restore_id)
+
+    def ready_restores(self, mailboxes, timeout_min=30, now=None):
+        now = now or datetime.now(timezone.utc)
+        out = []
+        for r in self.q("SELECT * FROM restores WHERE done_at IS NULL ORDER BY id"):
+            need = set(mailboxes) if r["rule_mailbox"] == "*" else {r["rule_mailbox"]}
+            boxes = json.loads(r["boxes"])
+            timed_out = r["created_at"] < now_iso(now - timedelta(minutes=timeout_min))
+            if need <= set(boxes) or timed_out:
+                out.append(dict(r, boxes=boxes, missing=sorted(need - set(boxes))))
+        return out
+
+    def close_restore(self, restore_id, now=None):
+        self.x("UPDATE restores SET done_at=? WHERE id=?", now_iso(now), restore_id)
 
     # ---------- contacts (для оценки полезности) ----------
     def add_contacts(self, addresses):

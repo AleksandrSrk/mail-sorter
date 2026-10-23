@@ -238,6 +238,11 @@ def parse_addresses(text: str) -> list[str]:
 
 
 def check_address(store, addr: str, own_domains=()) -> str:
+    return check_screen(store, addr, own_domains)[0]
+
+
+def check_screen(store, addr: str, own_domains=()):
+    """Текст проверки + кнопки «убрать из этого правила, письма во входящие» для активных записей."""
     dom = addr.rsplit("@", 1)[1]
     lines = [f"🔎 {addr}"]
     if dom in own_domains:
@@ -265,7 +270,25 @@ def check_address(store, addr: str, own_domains=()) -> str:
                 lines.append(f"   отписка {mark} {u['mailbox']}: {u['result'] or 'в очереди'}")
     sent = store.one("SELECT sent FROM contacts WHERE address=?", addr)
     lines.append(f"Мы ему писали: {sent['sent']} раз." if sent else "Мы ему не писали.")
-    return "\n".join(lines)
+    buttons = []
+    for e in rows:
+        if e["status"] in IN_FILTER:
+            what = "" if e["kind"] == "addr" else f"домен @{e['value']} "
+            buttons.append([(f"↩️ Убрать {what}из «{e['rule']}» → во входящие", f"x:rm:{e['id']}:0")])
+    return "\n".join(lines), buttons
+
+
+def restore(store, entry_id: int, own_domains=()):
+    """Кнопка из проверки: снять запись с правила, письма вернёт сортировщик. -> (экран, ответ)"""
+    e = store.queue_restore(entry_id)
+    if not e:
+        return None, "Запись не найдена"
+    addr = e["value"] if e["kind"] == "addr" else None
+    note = (f"Убран из «{e['rule_name']}». Письма вернутся во входящие в течение пары минут — пришлю сводку.")
+    if addr:
+        text, rows = check_screen(store, addr, own_domains)
+        return (text + "\n\n" + note, rows), "Готово"
+    return (f"Домен @{e['value']}: {note}", []), "Готово"
 
 
 def remove_from_spam(store, addr: str) -> str:

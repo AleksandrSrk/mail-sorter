@@ -285,6 +285,27 @@ class MailboxSorter:
             m.close()
         return moved, to_learn
 
+    # ---------- возврат во входящие ----------
+    def _restores(self, m, folders):
+        """Кнопка «убрать из фильтра» в боте: письма отправителя из папки правила — обратно во входящие."""
+        for job in self.store.pending_restores(self.login):
+            raw = folders.get(job["folder"])
+            n = 0
+            if raw:
+                typ, _ = m.select(_quote(raw))
+                if typ == "OK":
+                    typ, d = m.uid("SEARCH", None, "FROM", _quote(job["needle"]))
+                    found = d[0].split() if typ == "OK" and d and d[0] else []
+                    needle = job["needle"].lower()
+                    uids = [uid for uid, h in self._fetch_headers(m, found).items()
+                            if (h.sender == needle if not needle.startswith("@") else h.sender.endswith(needle))]
+                    if uids:
+                        self._move(m, uids, "INBOX", mark_read=False)
+                        n = len(uids)
+                        log.info("[%s] возврат %s: %s -> INBOX, писем %d", self.login, job["needle"], job["folder"], n)
+                    m.close()
+            self.store.restore_progress(job["id"], self.login, n)
+
     # ---------- main ----------
     def run_once(self, full=False) -> tuple[int, list]:
         """Один проход. full=True — все письма во всех папках, иначе только новые.
@@ -301,6 +322,7 @@ class MailboxSorter:
             events = self._learn(m, folders)
             if events:
                 self.reload_rules()  # выученные адреса работают уже в этом проходе
+            self._restores(m, folders)
             self._collect_sent(m, folders)
             dest = {r.move_to: self._ensure_folder(m, folders, r.move_to) for r in self.rules}
             for name, raw in list(folders.items()):

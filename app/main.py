@@ -112,6 +112,32 @@ def send_reports(store, settings, notifier, log):
         notifier.send(f"err:report:{type(e).__name__}", "❌ ошибка в отчётах", f"{e}\n\n{traceback.format_exc()[-2500:]}")
 
 
+def format_restore(r) -> str:
+    total = sum(r["boxes"].values())
+    lines = [f"↩️ {r['needle']} убран из «{r['rule_name']}»"]
+    if total:
+        lines.append(f"Во входящие возвращено писем: {total}")
+        lines += [f"  • {mb} — {n}" for mb, n in sorted(r["boxes"].items(), key=lambda x: -x[1]) if n]
+    else:
+        lines.append(f"В папке «{r['folder']}» его писем не было — возвращать нечего.")
+    if r["missing"]:
+        lines.append("⚠️ Не проверены (ящик недоступен): " + ", ".join(r["missing"]))
+    return "\n".join(lines)
+
+
+def send_restores(store, settings, notifier, log):
+    try:
+        for r in store.ready_restores(list(settings.mailboxes)):
+            text = format_restore(r)
+            log.info("возврат: %s", text.replace("\n", " | "))
+            if notifier.send(f"restore:{r['id']}", text, force=True) or not notifier.enabled:
+                store.close_restore(r["id"])
+    except Exception as e:
+        log.error("ошибка в возвратах: %s", e)
+        notifier.send(f"err:restore:{type(e).__name__}", "❌ ошибка при возврате писем",
+                      f"{e}\n\n{traceback.format_exc()[-2500:]}")
+
+
 def main():
     settings = load_settings()
     setup_logging(settings.data_dir)
@@ -170,6 +196,7 @@ def main():
         if not STOP:
             process_unsubs(store, settings, notifier, log)
             send_reports(store, settings, notifier, log)
+            send_restores(store, settings, notifier, log)
         heartbeat(settings.data_dir)
         delay = max(5, settings.poll_interval - (time.time() - started))
         while delay > 0 and not STOP:

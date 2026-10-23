@@ -74,10 +74,18 @@ def test_report_text_variants():
     assert t.startswith("↩️") and "навсегда" in t and "c@our.ru" in t
 
 
-
 def test_report_text_folder():
     r = {"sender": "robot@bank.ru", "mailbox": "b@our.ru", "boxes": {"a@our.ru": 2, "b@our.ru": 0},
          "missing": [], "action": "added", "unsubs": [], "no_unsub": False, "folder": "БАНК", "spam": False}
     t = main.format_report(r)
     assert t.startswith("📁 БАНК: добавлен robot@bank.ru") and "Положили в «БАНК» в ящике: b@our.ru" in t
     assert "перенесены в «БАНК»: 2" in t and "Отписка" not in t
+
+
+def test_restore_text():
+    r = {"needle": "x@y.ru", "rule_name": "Спам", "folder": "Junk", "boxes": {"a@our.ru": 3, "b@our.ru": 0},
+         "missing": []}
+    t = main.format_restore(r)
+    assert t.startswith("↩️ x@y.ru убран из «Спам»") and "возвращено писем: 3" in t and "b@our.ru" not in t
+    t = main.format_restore(dict(r, boxes={"a@our.ru": 0}))
+    assert "возвращать нечего" in t

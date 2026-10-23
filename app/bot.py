@@ -63,10 +63,28 @@ def build_router(store: Store, admin_id: int, own_domains=()) -> Router:
             return
         if mode == "remove":
             text = "\n\n".join(views.remove_from_spam(store, a) for a in addrs)
-        else:  # кнопка «проверить» или просто прислали адрес
-            text = "\n\n".join(views.check_address(store, a, own_domains) for a in addrs)
-        for i in range(0, len(text), 4000):
-            await m.answer(text[i:i + 4000], reply_markup=MENU)
+            for i in range(0, len(text), 4000):
+                await m.answer(text[i:i + 4000], reply_markup=MENU)
+            return
+        for a in addrs:  # кнопка «проверить» или просто прислали адрес — по сообщению на адрес, с кнопками
+            text, rows = views.check_screen(store, a, own_domains)
+            await m.answer(text[:4000], reply_markup=markup(rows) or MENU)
+
+    @r.callback_query(F.data.startswith("x:rm:"))
+    async def restore(c: CallbackQuery):
+        try:
+            entry_id = int(c.data.split(":")[2])
+        except (IndexError, ValueError):
+            await c.answer("Устаревшая кнопка")
+            return
+        screen, note = views.restore(store, entry_id, own_domains)
+        if screen:
+            text, rows = screen
+            try:
+                await c.message.edit_text(text[:4000], reply_markup=markup(rows))
+            except TelegramBadRequest:
+                pass
+        await c.answer(note)
 
     @r.callback_query(F.data == "noop")
     async def noop(c: CallbackQuery):

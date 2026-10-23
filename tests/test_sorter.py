@@ -252,3 +252,28 @@ def test_existing_folder_content_is_learned_on_start(store):
                      "БАНК": {"validity": 1, "msgs": {}}, "Junk": {"validity": 1, "msgs": {}}})
     moved, events = make(fake, store).run_once(full=True)
     assert events == [("robot@disl.ru", "added")] and moved == 1
+
+
+def test_restore_button_returns_letters_to_inbox(store):
+    from app import views
+    fake = FakeIMAP({"INBOX": {"validity": 1, "msgs": {1: ("bad@spam.ru", "a", False)}},
+                     "Junk": {"validity": 1, "msgs": {}}})
+    s = make(fake, store)
+    s.run_once(full=True)                                              # уехало в спам
+    fake.f["Junk"]["msgs"][9] = ("other@spam.ru", "x", False)           # чужое письмо в спаме — не трогаем
+    fake.next["Junk"] = 10
+    s.run_once()
+    text, rows = views.check_screen(store, "bad@spam.ru")
+    data = rows[0][0][1]
+    assert data.startswith("x:rm:") and "«Спам» → во входящие" in rows[0][0][0]
+    (text, rows), note = views.restore(store, int(data.split(":")[2]))
+    assert "⚪ снят с фильтра" in text and rows == []                 # кнопки больше нет
+    before = len(fake.stores)
+    s.run_once()
+    assert [m[0] for m in fake.f["INBOX"]["msgs"].values()] == ["bad@spam.ru"]
+    assert [m[0] for m in fake.f["Junk"]["msgs"].values()] == ["other@spam.ru"]
+    assert fake.stores[before:] == []                                  # флаги при возврате не трогаем
+    s.run_once()                                                       # во входящих и остаётся
+    assert [m[0] for m in fake.f["INBOX"]["msgs"].values()] == ["bad@spam.ru"]
+    r = store.ready_restores(["me@our.ru"])
+    assert len(r) == 1 and r[0]["boxes"] == {"me@our.ru": 1}
