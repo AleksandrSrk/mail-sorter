@@ -11,7 +11,7 @@ PAGE = 10
 STATUS = {
     "active": "",
     "unsubscribing": "📭 отписались, ждём тишину",
-    "unsubscribed": "✅ отписаны, сняты с фильтра",
+    "unsubscribed": "🔕 отписаны, сняты с фильтра",
     "removed": "↩️ снят с фильтра",
 }
 
@@ -103,11 +103,11 @@ def addresses(store, page=0):
     total = len(_addr_items(store, hidden=False))
     if not total:
         return "📧 Спам-адресов нет.", []
-    lines = [f"📧 Спам-адреса: {total}  (🗑 — убрать из фильтра, 🙈 — скрыть из списка)\n"]
+    lines = [f"📧 Спам-адреса: {total}  (✅ — не спам, убрать из фильтра; 🙈 — скрыть из списка)\n"]
     rows = []
     for i, it in enumerate(items, page * PAGE + 1):
         lines.append(f"{i}. {it['value']}{_mark(it)}")
-        rows.append([(f"{i} 🗑 убрать", f"a:del:{it['id']}:{page}"), (f"{i} 🙈 скрыть", f"a:hide:{it['id']}:{page}")])
+        rows.append([(f"{i} ✅ не спам", f"a:del:{it['id']}:{page}"), (f"{i} 🙈 скрыть", f"a:hide:{it['id']}:{page}")])
     return "\n".join(lines), rows + _nav("a", page, pages)
 
 
@@ -116,13 +116,13 @@ def domains(store, page=0):
     items, page, pages = _page(all_items, page)
     if not all_items:
         return "🌐 Спам-доменов нет.", []
-    lines = [f"🌐 Спам-домены: {len(all_items)}  (🗑 — убрать домен и все его адреса из фильтра, "
+    lines = [f"🌐 Спам-домены: {len(all_items)}  (✅ — не спам: убрать домен и все его адреса из фильтра, "
              f"🙈 — скрыть, ➕ — блокировать весь домен)\n"]
     rows = []
     for i, it in enumerate(items, page * PAGE + 1):
         what = "весь домен в фильтре" if it["whole"] else f"адресов в фильтре: {it['n']}"
         lines.append(f"{i}. {it['value']} — {what}{_mark(it)}")
-        row = [(f"{i} 🗑", f"d:del:{it['id']}:{page}"), (f"{i} 🙈", f"d:hide:{it['id']}:{page}")]
+        row = [(f"{i} ✅ не спам", f"d:del:{it['id']}:{page}"), (f"{i} 🙈", f"d:hide:{it['id']}:{page}")]
         if not it["whole"] and it["value"] not in FREE:
             row.append((f"{i} ➕ весь домен", f"d:all:{it['id']}:{page}"))
         rows.append(row)
@@ -135,12 +135,12 @@ def hidden(store, page=0):
     part, page, pages = _page(items, page)
     if not items:
         return "🙈 Скрытых нет.", []
-    lines = [f"🙈 Скрытые: {len(items)}  (🗑 — убрать из фильтра)\n"]
+    lines = [f"🙈 Скрытые: {len(items)}  (✅ — не спам, убрать из фильтра)\n"]
     rows = []
     for i, it in enumerate(part, page * PAGE + 1):
         label = it["value"] if it["t"] == "a" else f"домен {it['value']}"
         lines.append(f"{i}. {label}{_mark(it)}")
-        rows.append([(f"{i} 🗑 убрать из фильтра", f"h:del{it['t']}:{it['id']}:{page}")])
+        rows.append([(f"{i} ✅ не спам", f"h:del{it['t']}:{it['id']}:{page}")])
     return "\n".join(lines), rows + _nav("h", page, pages)
 
 
