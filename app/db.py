@@ -60,6 +60,18 @@ CREATE TABLE IF NOT EXISTS contacts(
     address TEXT PRIMARY KEY,
     sent INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS contact_boxes(
+    address TEXT NOT NULL,
+    mailbox TEXT NOT NULL,        -- из какого ящика мы ему писали
+    sent INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(address, mailbox)
+);
+CREATE TABLE IF NOT EXISTS lookups(
+    id INTEGER PRIMARY KEY,
+    address TEXT NOT NULL,        -- «где его письма» — запрос из проверки адреса в боте
+    boxes TEXT NOT NULL DEFAULT '{}',  -- {ящик: {"folders": {папка: писем от него}, "sent": наших ему, даты}}
+    created_at TEXT, sent_at TEXT
+);
 CREATE TABLE IF NOT EXISTS reports(
     id INTEGER PRIMARY KEY,
     sender TEXT NOT NULL,
@@ -404,6 +416,39 @@ class Store:
             self.queue_restore(eid, now=now)
         return self.one("SELECT * FROM notices WHERE id=?", notice_id), decision
 
+    # ---------- «где его письма»: поиск по всем ящикам и папкам ----------
+    def queue_lookup(self, address, now=None):
+        """Одна незавершённая проверка на адрес — повторные нажатия не плодят отчёты."""
+        address = _norm_addr(address)
+        r = self.one("SELECT id FROM lookups WHERE address=? AND sent_at IS NULL", address)
+        if r:
+            return r["id"]
+        self.x("INSERT INTO lookups(address, created_at) VALUES(?, ?)", address, now_iso(now))
+        return self.one("SELECT last_insert_rowid() AS id")["id"]
+
+    def pending_lookups(self, mailbox):
+        return [r for r in self.q("SELECT * FROM lookups WHERE sent_at IS NULL ORDER BY id")
+                if mailbox not in json.loads(r["boxes"])]
+
+    def lookup_progress(self, lookup_id, mailbox, info: dict):
+        r = self.one("SELECT boxes FROM lookups WHERE id=?", lookup_id)
+        boxes = json.loads(r["boxes"])
+        boxes[mailbox] = info
+        self.x("UPDATE lookups SET boxes=? WHERE id=?", json.dumps(boxes, ensure_ascii=False), lookup_id)
+
+    def ready_lookups(self, mailboxes, timeout_min=30, now=None):
+        now = now or datetime.now(timezone.utc)
+        out = []
+        for r in self.q("SELECT * FROM lookups WHERE sent_at IS NULL ORDER BY id"):
+            boxes = json.loads(r["boxes"])
+            timed_out = r["created_at"] < now_iso(now - timedelta(minutes=timeout_min))
+            if set(mailboxes) <= set(boxes) or timed_out:
+                out.append(dict(r, boxes=boxes, missing=sorted(set(mailboxes) - set(boxes))))
+        return out
+
+    def close_lookup(self, lookup_id, now=None):
+        self.x("UPDATE lookups SET sent_at=? WHERE id=?", now_iso(now), lookup_id)
+
     # ---------- contacts (для оценки полезности) ----------
     def add_contacts(self, addresses):
         for a in addresses:
@@ -411,6 +456,18 @@ class Store:
             if "@" in a:
                 self.x("INSERT INTO contacts(address, sent) VALUES(?, 1) "
                        "ON CONFLICT(address) DO UPDATE SET sent=sent+1", a)
+
+    def add_box_contacts(self, addresses, mailbox):
+        for a in addresses:
+            a = _norm_addr(a)
+            if "@" in a:
+                self.x("INSERT INTO contact_boxes(address, mailbox, sent) VALUES(?, ?, 1) "
+                       "ON CONFLICT(address, mailbox) DO UPDATE SET sent=sent+1", a, mailbox)
+
+    def box_contacts(self, address) -> dict:
+        """{ящик: сколько раз мы ему писали из этого ящика}"""
+        return {r["mailbox"]: r["sent"] for r in
+                self.q("SELECT mailbox, sent FROM contact_boxes WHERE address=?", _norm_addr(address))}
 
     def contacts(self):
         by_addr, by_domain = {}, {}

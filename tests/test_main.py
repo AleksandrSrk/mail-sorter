@@ -174,3 +174,27 @@ def test_server_spam_keep_learns_everywhere(store, monkeypatch):
     r = store.ready_reports(["a@our.ru", "b@our.ru"])
     assert r and r[0]["sender"] == "promo@shop.ru" and r[0]["boxes"] == {"a@our.ru": 0, "b@our.ru": 1}
     assert r[0]["unsubs"][0]["status"] == "done"
+
+
+def test_lookup_report_after_all_boxes(store):
+    (a, fa), (b, fb) = _boxes(store, [
+        ("a@our.ru", {"INBOX": {"validity": 1, "msgs": {1: ("partner@corp.ru", "Счёт", False)}},
+                      "Отправленные": {"validity": 1, "msgs": {1: ("me@our.ru", "partner@corp.ru", False)}}}),
+        ("b@our.ru", {"INBOX": {"validity": 1, "msgs": {}}}),
+    ])
+    a.run_once(full=True)
+    b.run_once(full=True)
+    store.queue_lookup("partner@corp.ru")
+    sent = []
+    notifier = SimpleNamespace(enabled=True, send=lambda key, subj, body="", force=False, buttons=None:
+                               sent.append(subj) or True)
+    settings = SimpleNamespace(mailboxes={"a@our.ru": 1, "b@our.ru": 1})
+    a.run_once()
+    main.send_lookups(store, settings, notifier, logging.getLogger("t"))
+    assert sent == []                                         # ждём второй ящик
+    b.run_once()
+    main.send_lookups(store, settings, notifier, logging.getLogger("t"))
+    assert len(sent) == 1 and "📬 a@our.ru: от него 1, от нас 1\n  • Входящие — 1" in sent[0]
+    assert "В остальных ящиках (1) ничего." in sent[0]
+    main.send_lookups(store, settings, notifier, logging.getLogger("t"))
+    assert len(sent) == 1

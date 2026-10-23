@@ -69,7 +69,8 @@ class FakeIMAP:
                        + (f"List-Unsubscribe: {lu}\r\n" if lu else "") + "\r\n")
                 if "BODY.PEEK[]" in args[1]:
                     hdr += f"Текст письма от {fr}: предлагаем услуги.\r\n\r\n-- \r\nподпись"
-                out.append((f"{u} (UID {u} BODY[...] {{1}}".encode(), hdr.encode()))
+                date = f'"{min(u, 28):02d}-Oct-2026 12:00:00 +0000"'      # дата письма = его UID (для тестов дат)
+                out.append((f"{u} (UID {u} INTERNALDATE {date} BODY[...] {{1}}".encode(), hdr.encode()))
                 out.append(b")")
             return "OK", out
         if cmd == "STORE":
@@ -280,3 +281,43 @@ def test_restore_button_returns_letters_to_inbox(store):
     assert [m[0] for m in fake.f["INBOX"]["msgs"].values()] == ["bad@spam.ru"]
     r = store.ready_restores(["me@our.ru"])
     assert len(r) == 1 and r[0]["boxes"] == {"me@our.ru": 1}
+
+
+def test_sent_contacts_by_mailbox_rebuilt_once(store):
+    fake = FakeIMAP({
+        "INBOX": {"validity": 1, "msgs": {}},
+        "Отправленные": {"validity": 1, "msgs": {1: ("me@our.ru", "client@corp.ru", False),
+                                                 2: ("me@our.ru", "client@corp.ru", False)}},
+    })
+    state = {"sent:Отправленные": [1, 1]}            # старая версия уже учла письмо 1 в общем списке
+    store.add_contacts(["client@corp.ru"])
+    s = make(fake, store, state)
+    s.run_once()
+    assert store.contacts()[0] == {"client@corp.ru": 2}             # общий учёт без двойного счёта
+    assert store.box_contacts("client@corp.ru") == {"me@our.ru": 2}  # по ящику — вся история
+    fake.f["Отправленные"]["msgs"][3] = ("me@our.ru", "client@corp.ru", False)
+    fake.next["Отправленные"] = 4
+    s.run_once()
+    assert store.contacts()[0] == {"client@corp.ru": 3}
+    assert store.box_contacts("client@corp.ru") == {"me@our.ru": 3}  # дальше — только новые
+
+
+def test_lookup_counts_folders_sent_and_dates(store):
+    fake = FakeIMAP({
+        "INBOX": {"validity": 1, "msgs": {3: ("partner@corp.ru", "Счёт", False), 5: ("xpartner@corp.ru", "чужой", False),
+                                           9: ("partner@corp.ru", "Акт", False)}},
+        "Archive": {"validity": 1, "msgs": {2: ("partner@corp.ru", "Старое", False)}},
+        "Отправленные": {"validity": 1, "msgs": {4: ("me@our.ru", "partner@corp.ru", False),
+                                                 6: ("me@our.ru", "other@corp.ru", False)}},
+    })
+    s = make(fake, store)
+    s.run_once(full=True)
+    lid = store.queue_lookup("Partner@Corp.ru")
+    assert store.queue_lookup("partner@corp.ru") == lid                 # повторная проверка — тот же запрос
+    s.run_once()
+    info = store.ready_lookups(["me@our.ru"])[0]["boxes"]["me@our.ru"]
+    assert info["folders"] == {"INBOX": 2, "Archive": 1}               # xpartner@ не считается
+    assert info["sent"] == 1 and info["last_sent"] == "2026-10-04"
+    assert (info["first"], info["last"]) == ("2026-10-02", "2026-10-09")
+    s.run_once()
+    assert store.pending_lookups("me@our.ru") == []                     # ящик отчитался — больше не ищет

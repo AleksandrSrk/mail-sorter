@@ -62,7 +62,7 @@ def build_router(store: Store, admin_id: int, own_domains=()) -> Router:
             await m.answer("Не вижу адреса почты. Нажми кнопку ещё раз и пришли адрес вида name@domain.ru.")
             return
         for a in addrs:  # кнопка «проверить» или просто прислали адрес — по сообщению на адрес, с кнопками
-            text, rows = views.check_screen(store, a, own_domains)
+            text, rows = views.check_with_lookup(store, a, own_domains)
             await m.answer(text[:4000], reply_markup=markup(rows) or MENU)
 
     @r.callback_query(F.data.startswith("x:rm:") | F.data.startswith("x:ex:"))

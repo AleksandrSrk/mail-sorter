@@ -15,7 +15,7 @@ from .sorter import MailboxSorter
 from .state import StateStore
 from .unsub import unsubscribe
 from .snippet import summarize_many
-from .views import format_notice, notice_buttons
+from .views import format_lookup, format_notice, notice_buttons
 
 STOP = False
 
@@ -155,6 +155,18 @@ def send_notices(store, settings, notifier, log):
                       f"{e}\n\n{traceback.format_exc()[-2500:]}")
 
 
+def send_lookups(store, settings, notifier, log):
+    """Отчёт «где его письма» — когда все ящики посмотрели свои папки."""
+    try:
+        for r in store.ready_lookups(list(settings.mailboxes)):
+            if notifier.send(f"lookup:{r['id']}", format_lookup(r), force=True) or not notifier.enabled:
+                store.close_lookup(r["id"])
+    except Exception as e:
+        log.error("ошибка в отчёте по адресу: %s", e)
+        notifier.send(f"err:lookup:{type(e).__name__}", "❌ ошибка в отчёте «где его письма»",
+                      f"{e}\n\n{traceback.format_exc()[-2500:]}")
+
+
 def main():
     settings = load_settings()
     setup_logging(settings.data_dir)
@@ -215,6 +227,7 @@ def main():
             send_reports(store, settings, notifier, log)
             send_restores(store, settings, notifier, log)
             send_notices(store, settings, notifier, log)
+            send_lookups(store, settings, notifier, log)
         heartbeat(settings.data_dir)
         delay = max(5, settings.poll_interval - (time.time() - started))
         while delay > 0 and not STOP:

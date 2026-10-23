@@ -153,16 +153,38 @@ class MailboxSorter:
                                         name.strip())
         return out
 
-    def _fetch_recipients(self, m, uids):
-        found = []
+    def _recipients_by_uid(self, m, uids) -> dict:
+        out = {}
         for i in range(0, len(uids), CHUNK):
             typ, data = m.uid("FETCH", b",".join(uids[i:i + CHUNK]).decode(), RCPT_HEADERS)
             for item in data or []:
                 if isinstance(item, tuple):
+                    uid = re.search(rb"UID (\d+)", item[0])
+                    if not uid:
+                        continue
                     msg = email.message_from_bytes(item[1])
                     vals = [_decode_header(v) for h in ("To", "Cc", "Bcc") for v in msg.get_all(h, [])]
-                    found += [a.lower() for _, a in email.utils.getaddresses(vals) if "@" in a]
-        return found
+                    out[uid.group(1)] = [a.lower() for _, a in email.utils.getaddresses(vals) if "@" in a]
+        return out
+
+    def _fetch_recipients(self, m, uids):
+        return [a for rcpt in self._recipients_by_uid(m, uids).values() for a in rcpt]
+
+    @staticmethod
+    def _dates(m, uids):
+        """Даты (INTERNALDATE) первого и последнего по UID письма: ('YYYY-MM-DD', 'YYYY-MM-DD')."""
+        if not uids:
+            return "", ""
+        edge = sorted({min(uids, key=int), max(uids, key=int)}, key=int)
+        typ, data = m.uid("FETCH", ",".join(u.decode() if isinstance(u, bytes) else str(u) for u in edge),
+                          "(INTERNALDATE)")
+        got = []
+        for item in data or []:
+            line = item[0] if isinstance(item, tuple) else item
+            t = imaplib.Internaldate2tuple(line) if isinstance(line, bytes) else None
+            if t:
+                got.append("%04d-%02d-%02d" % t[:3])
+        return (min(got), max(got)) if got else ("", "")
 
     def _move(self, m, uids, dest_raw, mark_read):
         uid_set = b",".join(uids).decode()
@@ -244,17 +266,28 @@ class MailboxSorter:
         return events
 
     def _collect_sent(self, m, folders):
-        """Кому мы писали — для оценки «полезности» адресов в боте."""
+        """Кому мы писали и из какого ящика — для защиты от серверной метки, «полезности» и проверки в боте.
+        Учёт по ящикам появился позже общего: один раз перечитываем «Отправленные» целиком только для него."""
         raw = folders.get(SENT_FOLDER)
         if not raw:
             return 0
         key = "sent:" + raw
-        res = self._new_uids(m, raw, full=False, key=key)
+        rebuild_key = "contact_boxes:" + self.login
+        rebuild = not self.store.meta(rebuild_key)
+        prev = self.state.get(key)
+        res = self._new_uids(m, raw, full=rebuild, key=key)
         if res is None:
             return 0
         uids, uidvalidity, max_uid = res
-        found = self._fetch_recipients(m, uids) if uids else []
-        self.store.add_contacts(found)
+        by_uid = self._recipients_by_uid(m, uids) if uids else {}
+        found = [a for rcpt in by_uid.values() for a in rcpt]
+        if rebuild and prev and prev[0] == uidvalidity:   # в общий учёт — только то, чего там ещё не было
+            self.store.add_contacts([a for u, rcpt in by_uid.items() if int(u) > prev[1] for a in rcpt])
+        else:
+            self.store.add_contacts(found)
+        self.store.add_box_contacts(found, self.login)
+        if rebuild:
+            self.store.set_meta(rebuild_key, "1")
         m.close()
         self.state[key] = [uidvalidity, max_uid]
         return len(found)
@@ -350,6 +383,35 @@ class MailboxSorter:
                 m.close()
             self.store.notice_progress(n["id"], self.login, info)
 
+    # ---------- «где его письма» ----------
+    def _lookups(self, m, folders):
+        """Запрос из проверки адреса: сколько его писем в каждой папке ящика и сколько мы ему отправили."""
+        for job in self.store.pending_lookups(self.login):
+            addr = job["address"]
+            info = {"folders": {}, "sent": 0, "first": "", "last": "", "last_sent": ""}
+            for name, raw in folders.items():
+                typ, _ = m.select(_quote(raw), readonly=True)
+                if typ != "OK":
+                    continue
+                if name == SENT_FOLDER:
+                    typ, d = m.uid("SEARCH", None, "TO", _quote(addr))
+                    found = d[0].split() if typ == "OK" and d and d[0] else []
+                    mine = [u for u, rcpt in self._recipients_by_uid(m, found).items() if addr in rcpt]
+                    if mine:
+                        info["sent"] += len(mine)
+                        info["last_sent"] = max(info["last_sent"], self._dates(m, mine)[1])
+                else:
+                    typ, d = m.uid("SEARCH", None, "FROM", _quote(addr))
+                    found = d[0].split() if typ == "OK" and d and d[0] else []
+                    mine = [u for u, h in self._fetch_headers(m, found).items() if h.sender == addr]
+                    if mine:
+                        info["folders"][name] = len(mine)
+                        first, last = self._dates(m, mine)
+                        info["first"] = min(filter(None, [info["first"], first]), default="")
+                        info["last"] = max(info["last"], last)
+                m.close()
+            self.store.lookup_progress(job["id"], self.login, info)
+
     # ---------- возврат во входящие ----------
     def _restores(self, m, folders):
         """Кнопка «убрать из фильтра» в боте: письма отправителя из папки правила — обратно во входящие."""
@@ -436,6 +498,7 @@ class MailboxSorter:
                 self._skip_own_moves(m, folders, moved_to_learn)
             if self.learn:
                 self._notices(m, folders)   # после переносов — чтобы посчитать и только что пойманное
+            self._lookups(m, folders)
             if self.learn_folders:
                 self.store.report_progress(self.login, set(self.state.get(self.SWEPT_KEY, [])), self.moved_by_sender)
         finally:

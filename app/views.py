@@ -269,7 +269,12 @@ def check_screen(store, addr: str, own_domains=()):
                 mark = {"done": "✅", "failed": "❌"}.get(u["status"], "⏳")
                 lines.append(f"   отписка {mark} {u['mailbox']}: {u['result'] or 'в очереди'}")
     sent = store.one("SELECT sent FROM contacts WHERE address=?", addr)
-    lines.append(f"Мы ему писали: {sent['sent']} раз." if sent else "Мы ему не писали.")
+    if sent:
+        boxes = store.box_contacts(addr)
+        lines.append(f"Мы ему писали: {letters(sent['sent'])}" + ("" if boxes else " (по ящикам — после ближайшего прохода)"))
+        lines += [f"  • {_short_box(mb)} — {n}" for mb, n in sorted(boxes.items(), key=lambda x: (-x[1], x[0]))]
+    else:
+        lines.append("Мы ему не писали.")
     buttons = []
     own_addr_rules = {e["rule_id"] for e in rows if e["kind"] == "addr"}
     for e in rows:
@@ -290,6 +295,16 @@ def check_screen(store, addr: str, own_domains=()):
         if len(data.encode()) <= 64:
             buttons.append([("✅ Не спам — не трогать по метке сервера, письма во входящие", data)])
     return "\n".join(lines), buttons
+
+
+LOOKUP_NOTE = "⏳ Смотрю его письма во всех ящиках и папках — отчёт придёт через минуту-две."
+
+
+def check_with_lookup(store, addr: str, own_domains=()):
+    """Проверка из бота: правила сразу + поиск писем по ящикам в очередь сортировщику."""
+    text, rows = check_screen(store, addr, own_domains)
+    store.queue_lookup(addr)
+    return f"{text}\n\n{LOOKUP_NOTE}", rows
 
 
 def exempt(store, rule_id: int, addr: str, own_domains=()):
@@ -317,6 +332,51 @@ def restore(store, entry_id: int, own_domains=()):
 def _short_box(mb):
     local, _, dom = mb.partition("@")
     return f"{local}@{dom.split('.')[0]}"
+
+
+def letters(n: int) -> str:
+    """2 письма, 5 писем, 21 письмо."""
+    if n % 10 == 1 and n % 100 != 11:
+        word = "письмо"
+    elif n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        word = "письма"
+    else:
+        word = "писем"
+    return f"{n} {word}"
+
+
+FOLDER_NAMES = {"INBOX": "Входящие"}
+
+
+def format_lookup(r) -> str:
+    """Отчёт «где его письма»: по ящикам и папкам, сколько мы ему писали, даты."""
+    boxes = r["boxes"]
+    got = sum(sum(i["folders"].values()) for i in boxes.values())
+    sent = sum(i["sent"] for i in boxes.values())
+    lines = [f"📊 {r['address']} — письма по ящикам",
+             f"От него: {letters(got)} · от нас ему: {letters(sent)}"]
+    active = sorted(((mb, i) for mb, i in boxes.items() if i["folders"] or i["sent"]),
+                    key=lambda x: (-(sum(x[1]["folders"].values()) + x[1]["sent"]), x[0]))
+    for mb, i in active:
+        n = sum(i["folders"].values())
+        lines.append("")
+        lines.append(f"📬 {mb}: от него {n}" + (f", от нас {i['sent']}" if i["sent"] else ""))
+        lines += [f"  • {FOLDER_NAMES.get(f, f)} — {k}" for f, k in sorted(i["folders"].items(), key=lambda x: (-x[1], x[0]))]
+        dates = []
+        if i.get("last"):
+            dates.append(f"от него: {i['first']} … {i['last']}" if i.get("first") and i["first"] != i["last"]
+                         else f"от него: {i['last']}")
+        if i.get("last_sent"):
+            dates.append(f"наше последнее: {i['last_sent']}")
+        if dates:
+            lines.append("  " + " · ".join(dates))
+    if not active:
+        lines.append("Ни в одном ящике писем от него и к нему нет.")
+    elif len(boxes) > len(active):
+        lines.append(f"\nВ остальных ящиках ({len(boxes) - len(active)}) ничего.")
+    if r.get("missing"):
+        lines.append("⚠️ Не проверены (ящик недоступен): " + ", ".join(r["missing"]))
+    return "\n".join(lines)
 
 
 def format_notice(n) -> str:

@@ -101,7 +101,11 @@ def test_check_address_everywhere(store):
     assert "весь домен @junk.example" in t
     store.add_contacts(["nobody@corp.ru"])
     t = views.check_address(store, "nobody@corp.ru", own_domains={"our.ru"})
-    assert "Ни в одном списке нет." in t and "писали: 1 раз" in t
+    assert "Ни в одном списке нет." in t and "писали: 1 письмо (по ящикам — после ближайшего прохода)" in t
+    store.add_box_contacts(["nobody@corp.ru"] * 3, "b@our.ru")
+    store.add_box_contacts(["nobody@corp.ru"] * 2, "a@our.ru")
+    t = views.check_address(store, "nobody@corp.ru", own_domains={"our.ru"})
+    assert "писали: 1 письмо\n  • b@our — 3\n  • a@our — 2" in t
     assert "Свой домен" in views.check_address(store, "boss@our.ru", own_domains={"our.ru"})
 
 
@@ -129,3 +133,29 @@ def test_not_spam_button_for_server_flagged_sender(store):
     assert rows == []
     _, rows = views.check_screen(store, "boss@our.ru", own_domains={"our.ru"})
     assert rows == []                                                       # свои — кнопка не нужна
+
+
+def test_letters_plural():
+    assert [views.letters(n) for n in (1, 2, 5, 11, 12, 21, 22, 25, 101)] == [
+        "1 письмо", "2 письма", "5 писем", "11 писем", "12 писем", "21 письмо", "22 письма", "25 писем", "101 письмо"]
+
+
+def test_check_queues_lookup_and_report_text(store):
+    text, _ = views.check_with_lookup(store, "partner@corp.ru")
+    assert text.endswith(views.LOOKUP_NOTE)
+    views.check_with_lookup(store, "partner@corp.ru")
+    assert len(store.q("SELECT * FROM lookups")) == 1                  # повторная проверка не плодит отчёты
+    r = {"address": "partner@corp.ru", "missing": ["c@our.ru"], "boxes": {
+        "a@our.ru": {"folders": {"INBOX": 3, "Archive": 9}, "sent": 2, "first": "2025-01-10", "last": "2026-10-20",
+                     "last_sent": "2026-10-21"},
+        "b@our.ru": {"folders": {}, "sent": 0, "first": "", "last": "", "last_sent": ""},
+        "d@our.ru": {"folders": {"Нежелательная почта": 1}, "sent": 0, "first": "2026-10-23", "last": "2026-10-23",
+                     "last_sent": ""}}}
+    t = views.format_lookup(r)
+    assert t.startswith("📊 partner@corp.ru — письма по ящикам\nОт него: 13 писем · от нас ему: 2 письма")
+    assert ("📬 a@our.ru: от него 12, от нас 2\n  • Archive — 9\n  • Входящие — 3\n"
+            "  от него: 2025-01-10 … 2026-10-20 · наше последнее: 2026-10-21") in t
+    assert "📬 d@our.ru: от него 1\n  • Нежелательная почта — 1\n  от него: 2026-10-23" in t
+    assert "В остальных ящиках (1) ничего." in t and "Не проверены (ящик недоступен): c@our.ru" in t
+    empty = views.format_lookup({"address": "x@y.ru", "missing": [], "boxes": {"a@our.ru": r["boxes"]["b@our.ru"]}})
+    assert "Ни в одном ящике писем от него и к нему нет." in empty
