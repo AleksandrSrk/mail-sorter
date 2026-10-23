@@ -16,6 +16,7 @@ class FakeIMAP:
         self.sel = None
         self.next = {n: max(d["msgs"] or {0: 0}) + 1 for n, d in folders.items()}
         self.fetched = []
+        self.searches = []
 
     def capability(self):
         return "OK", [b"IMAP4rev1 MOVE"]
@@ -48,6 +49,10 @@ class FakeIMAP:
 
     def uid(self, cmd, *args):
         msgs = self.f[self.sel]["msgs"]
+        if cmd == "SEARCH" and args[1] == "FROM":
+            needle = args[2].strip('"').lower()
+            self.searches.append((self.sel, needle))
+            return "OK", [b" ".join(str(u).encode() for u in sorted(msgs) if needle in msgs[u][0].lower())]
         if cmd == "SEARCH":
             lo = int(args[2].split(":")[0])
             return "OK", [b" ".join(str(u).encode() for u in sorted(msgs) if u >= lo)]
@@ -143,3 +148,21 @@ def test_own_domain_never_spam_even_with_flag(store):
     fake = FakeIMAP({"INBOX": {"validity": 1, "msgs": {1: ("colleague@our.ru", "a", True)}},
                      "Junk": {"validity": 1, "msgs": {}}})
     assert make(fake, store).run_once(full=True)[0] == 0
+
+
+def test_new_address_sweeps_old_letters(store):
+    fake = FakeIMAP({"INBOX": {"validity": 1, "msgs": {1: ("old@veles.ru", "a", False), 2: ("ok@y.ru", "b", False)}},
+                     "Archive": {"validity": 1, "msgs": {1: ("x@newdom.ru", "c", False)}},
+                     "Junk": {"validity": 1, "msgs": {}}})
+    s = make(fake, store)
+    assert s.run_once(full=True)[0] == 0
+    assert s.run_once() == (0, []) and fake.searches == []          # ничего нового — не ищем
+    rid = store.learn_rule()["id"]
+    store.add_entry(rid, "addr", "old@veles.ru", "learned")          # выучили в другом ящике
+    store.add_entry(rid, "domain", "newdom.ru", "bot")               # ➕ весь домен в боте
+    moved, _ = s.run_once()
+    assert moved == 2                                                # старые письма уехали без ночного прохода
+    assert sorted(fake.f["INBOX"]["msgs"]) == [2] and fake.f["Archive"]["msgs"] == {}
+    assert {n for _, n in fake.searches} == {"old@veles.ru", "@newdom.ru"}
+    fake.searches.clear()
+    assert s.run_once()[0] == 0 and fake.searches == []             # второй раз по тем же не ищем

@@ -232,6 +232,49 @@ class MailboxSorter:
         if uidnext is not None:
             self.state[raw] = [uidvalidity, uidnext - 1]
 
+    # ---------- догоняющий поиск по новым адресам ----------
+    SWEPT_KEY = "_swept"
+
+    def _targets(self) -> dict:
+        """Адреса и домены всех правил ящика: ключ -> строка для IMAP SEARCH FROM."""
+        out = {}
+        for r in self.rules:
+            for a in r.senders:
+                out[f"{r.id}:a:{a}"] = a
+            for d in r.sender_domains:
+                out[f"{r.id}:d:{d}"] = "@" + d
+        return out
+
+    def _sweep(self, m, folders, dest, needles) -> tuple[int, bool]:
+        """Старые письма от только что добавленных адресов/доменов — ищем на сервере и переносим,
+        не дожидаясь ночного полного прохода. Решение всё равно принимает pick_rule по заголовкам."""
+        moved, to_learn = 0, False
+        for name, raw in folders.items():
+            if name in self.skip:
+                continue
+            typ, _ = m.select(_quote(raw))
+            if typ != "OK":
+                continue
+            found = set()
+            for needle in needles:
+                typ, d = m.uid("SEARCH", None, "FROM", _quote(needle))
+                if typ == "OK" and d and d[0]:
+                    found.update(d[0].split())
+            if found:
+                plan = {}
+                for uid, h in self._fetch_headers(m, sorted(found, key=int)).items():
+                    rule = self.pick_rule(h)
+                    if rule:
+                        plan.setdefault(rule.id or rule.name, (rule, []))[1].append(uid)
+                for rule, uids in plan.values():
+                    self._move(m, uids, dest[rule.move_to], rule.mark_read)
+                    moved += len(uids)
+                    to_learn |= bool(self.learn and rule.move_to == self.learn.folder)
+                    log.info("[%s] %s (новые адреса, старые письма): %s -> %s, писем %d",
+                             self.login, rule.name, name, rule.move_to, len(uids))
+            m.close()
+        return moved, to_learn
+
     # ---------- main ----------
     def run_once(self, full=False) -> tuple[int, list]:
         """Один проход. full=True — все письма во всех папках, иначе только новые.
@@ -273,6 +316,17 @@ class MailboxSorter:
                         log.info("[%s] %s: %s -> %s, писем %d", self.login, rule.name, name, rule.move_to, len(items))
                 m.close()
                 self.state[raw] = [uidvalidity, max_uid]
+            targets = self._targets()
+            if full:
+                self.state[self.SWEPT_KEY] = sorted(targets)   # полный проход уже всё перебрал
+            else:
+                swept = set(self.state.get(self.SWEPT_KEY, []))
+                fresh = [k for k in targets if k not in swept]
+                if fresh:
+                    n, to_learn = self._sweep(m, folders, dest, sorted({targets[k] for k in fresh}))
+                    moved_total += n
+                    moved_to_learn |= to_learn
+                    self.state[self.SWEPT_KEY] = sorted(swept | set(fresh))
             if moved_to_learn:
                 self._skip_own_moves(m, folders)
         finally:
