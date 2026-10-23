@@ -354,8 +354,13 @@ def format_lookup(r) -> str:
     boxes = r["boxes"]
     got = sum(sum(i["folders"].values()) for i in boxes.values())
     sent = sum(i["sent"] for i in boxes.values())
+    def by_box(count):
+        parts = sorted(((mb, count(i)) for mb, i in boxes.items() if count(i)), key=lambda x: (-x[1], x[0]))
+        return ", ".join(f"{_short_box(mb)} {n}" for mb, n in parts)
+
     lines = [f"📊 {r['address']} — письма по ящикам",
-             f"От него: {letters(got)} · от нас ему: {letters(sent)}"]
+             f"Он нам: {letters(got)} — {by_box(lambda i: sum(i['folders'].values()))}" if got else "Он нам: писем нет",
+             f"Мы ему: {letters(sent)} — {by_box(lambda i: i['sent'])}" if sent else "Мы ему: не писали"]
     active = sorted(((mb, i) for mb, i in boxes.items() if i["folders"] or i["sent"]),
                     key=lambda x: (-(sum(x[1]["folders"].values()) + x[1]["sent"]), x[0]))
     for mb, i in active:

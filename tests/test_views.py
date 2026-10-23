@@ -152,12 +152,14 @@ def test_check_queues_lookup_and_report_text(store):
         "d@our.ru": {"folders": {"Нежелательная почта": 1}, "sent": 0, "first": "2026-10-23", "last": "2026-10-23",
                      "last_sent": ""}}}
     t = views.format_lookup(r)
-    assert t.startswith("📊 partner@corp.ru — письма по ящикам\nОт него: 13 писем · от нас ему: 2 письма")
+    assert t.startswith("📊 partner@corp.ru — письма по ящикам\n"
+                        "Он нам: 13 писем — a@our 12, d@our 1\nМы ему: 2 письма — a@our 2\n")
     assert ("📬 a@our.ru: от него 12, от нас 2\n  • Archive — 9\n  • Входящие — 3\n"
             "  от него: 2025-01-10 … 2026-10-20 · наше последнее: 2026-10-21") in t
     assert "📬 d@our.ru: от него 1\n  • Нежелательная почта — 1\n  от него: 2026-10-23" in t
     assert "В остальных ящиках (1) ничего." in t and "Не проверены (ящик недоступен): c@our.ru" in t
     empty = views.format_lookup({"address": "x@y.ru", "missing": [], "boxes": {"a@our.ru": r["boxes"]["b@our.ru"]}})
+    assert "Он нам: писем нет\nМы ему: не писали" in empty
     assert "Ни в одном ящике писем от него и к нему нет." in empty
 
 
