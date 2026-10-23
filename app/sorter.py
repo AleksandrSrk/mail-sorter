@@ -5,15 +5,25 @@ import email.utils
 import imaplib
 import logging
 import re
+from collections import namedtuple
 
 from . import imap_utf7
-from .config import LearnSpam, Rule
+from .config import DEFAULT_SKIP_FOLDERS, LearnSpam, Rule
 
 log = logging.getLogger("sorter")
 LIST_RE = re.compile(rb'\((?P<flags>.*?)\) "(?P<sep>.)" (?P<name>.*)')
 STATUS_RE = re.compile(rb"UIDNEXT (\d+).*?UIDVALIDITY (\d+)|UIDVALIDITY (\d+).*?UIDNEXT (\d+)")
-HEADERS = "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT X-SPAM-FLAG X-SPAM-STATUS)])"
+HEADERS = ("(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT X-SPAM-FLAG X-SPAM-STATUS "
+           "LIST-UNSUBSCRIBE LIST-UNSUBSCRIBE-POST)])")
+RCPT_HEADERS = "(BODY.PEEK[HEADER.FIELDS (TO CC BCC)])"
+SENT_FOLDER = "Отправленные"
 CHUNK = 500
+
+Hdr = namedtuple("Hdr", "sender subject flag lu lup")
+
+
+def _clean(v) -> str:
+    return " ".join(str(v or "").split())
 
 
 def _decode_header(value: str) -> str:
@@ -43,17 +53,25 @@ def parse_status(line: bytes):
 
 
 class MailboxSorter:
-    def __init__(self, host, port, login, password, rules, skip_folders, box_state: dict,
-                 learn: LearnSpam | None = None, learned=None, timeout=120):
+    def __init__(self, host, port, login, password, store, box_state: dict, own_domains=(), timeout=120):
         self.host, self.port = host, port
         self.login, self.password = login, password
-        self.rules: list[Rule] = rules
-        self.skip = set(skip_folders) | {r.move_to for r in rules}
+        self.store = store
         self.state = box_state            # {raw_folder: [uidvalidity, last_uid]}
-        self.learn = learn
-        self.learned = learned            # LearnedSpam
+        self.own_domains = set(own_domains)
         self.timeout = timeout
         self.caps = set()
+        self.rules: list[Rule] = []
+        self.learn: LearnSpam | None = None
+        self.skip = set(DEFAULT_SKIP_FOLDERS)
+
+    def reload_rules(self):
+        """Правила читаются из базы перед каждым проходом — правки из бота применяются через минуту."""
+        self.rules = self.store.rules_for(self.login)
+        lr = self.store.learn_rule()
+        self.learn = LearnSpam(folder=lr["move_to"], never_domains=self.own_domains) if lr else None
+        self.skip = set(DEFAULT_SKIP_FOLDERS) | {r.move_to for r in self.rules} | \
+            ({self.learn.folder} if self.learn else set())
 
     # ---------- IMAP helpers ----------
     def _connect(self):
@@ -89,9 +107,9 @@ class MailboxSorter:
         log.info("[%s] создана папка %s", self.login, name)
         return raw
 
-    def _new_uids(self, m, raw, full):
+    def _new_uids(self, m, raw, full, key=None):
         """Выбирает папку и возвращает (uids к проверке, uidvalidity, max_uid). None — папку пропустить."""
-        prev = self.state.get(raw)
+        prev = self.state.get(key or raw)
         typ, st = m.status(_quote(raw), "(UIDNEXT UIDVALIDITY)")
         uidnext, uidvalidity = parse_status(st[0] if typ == "OK" and st else b"")
         if uidnext is None:
@@ -123,8 +141,20 @@ class MailboxSorter:
                 sender = email.utils.parseaddr(_decode_header(msg.get("From", "")))[1].lower()
                 flag = (msg.get("X-Spam-Flag") or "").strip().upper().startswith("YES") or \
                        (msg.get("X-Spam-Status") or "").strip().upper().startswith("YES")
-                out[uid.group(1)] = (sender, _decode_header(msg.get("Subject", "")), flag)
+                out[uid.group(1)] = Hdr(sender, _decode_header(msg.get("Subject", "")), flag,
+                                        _clean(msg.get("List-Unsubscribe")), _clean(msg.get("List-Unsubscribe-Post")))
         return out
+
+    def _fetch_recipients(self, m, uids):
+        found = []
+        for i in range(0, len(uids), CHUNK):
+            typ, data = m.uid("FETCH", b",".join(uids[i:i + CHUNK]).decode(), RCPT_HEADERS)
+            for item in data or []:
+                if isinstance(item, tuple):
+                    msg = email.message_from_bytes(item[1])
+                    vals = [_decode_header(v) for h in ("To", "Cc", "Bcc") for v in msg.get_all(h, [])]
+                    found += [a.lower() for _, a in email.utils.getaddresses(vals) if "@" in a]
+        return found
 
     def _move(self, m, uids, dest_raw, mark_read):
         uid_set = b",".join(uids).decode()
@@ -144,18 +174,18 @@ class MailboxSorter:
         else:
             m.expunge()
 
-    def pick_rule(self, sender, subject, flag):
-        learned = self.learned.items if self.learned else frozenset()
+    def pick_rule(self, h: Hdr):
         for rule in self.rules:
-            if rule.learn and self.learn and not self.learn.allowed(sender):
-                continue  # белый список / свои домены — не спам
-            if rule.matches(sender, subject, flag, learned):
+            if rule.learn and self.learn and not self.learn.allowed(h.sender):
+                continue  # свои домены никогда не спам
+            if rule.matches(h.sender, h.subject, h.flag):
                 return rule
         return None
 
     # ---------- learning ----------
     def _learn(self, m, folders):
-        if not (self.learn and self.learned is not None):
+        """Новые письма в папке спама положил туда пользователь — учимся (и ставим отписку в очередь)."""
+        if not self.learn:
             return []
         raw = folders.get(self.learn.folder)
         if not raw:
@@ -164,15 +194,35 @@ class MailboxSorter:
         if res is None:
             return []
         uids, uidvalidity, max_uid = res
-        new = []
+        events = []
         if uids:
-            senders = {s for s, _, _ in self._fetch_headers(m, uids).values() if self.learn.allowed(s)}
-            new = self.learned.add(senders)
-            if new:
-                log.info("[%s] в спам-список добавлены: %s", self.login, ", ".join(new))
+            for h in self._fetch_headers(m, uids).values():
+                if self.learn.allowed(h.sender):
+                    action = self.store.learn(h.sender, self.login, h.lu, h.lup)
+                    if action:
+                        events.append((h.sender, action))
+            for sender, action in events:
+                log.info("[%s] спам-фильтр: %s %s", self.login,
+                         "добавлен" if action == "added" else "возвращён", sender)
         m.close()
         self.state[raw] = [uidvalidity, max_uid]
-        return new
+        return events
+
+    def _collect_sent(self, m, folders):
+        """Кому мы писали — для оценки «полезности» адресов в боте."""
+        raw = folders.get(SENT_FOLDER)
+        if not raw:
+            return 0
+        key = "sent:" + raw
+        res = self._new_uids(m, raw, full=False, key=key)
+        if res is None:
+            return 0
+        uids, uidvalidity, max_uid = res
+        found = self._fetch_recipients(m, uids) if uids else []
+        self.store.add_contacts(found)
+        m.close()
+        self.state[key] = [uidvalidity, max_uid]
+        return len(found)
 
     def _skip_own_moves(self, m, folders):
         """Письма, которые мы сами перенесли в папку спама, не должны попасть в обучение."""
@@ -185,7 +235,8 @@ class MailboxSorter:
     # ---------- main ----------
     def run_once(self, full=False) -> tuple[int, list]:
         """Один проход. full=True — все письма во всех папках, иначе только новые.
-        Возвращает (перенесено писем, новые адреса в спам-списке)."""
+        Возвращает (перенесено писем, события обучения [(адрес, 'added'|'returned')])."""
+        self.reload_rules()
         if not self.rules and not self.learn:
             return 0, []
         moved_total = 0
@@ -193,7 +244,10 @@ class MailboxSorter:
         m = self._connect()
         try:
             folders = self._folders(m)
-            learned_new = self._learn(m, folders)
+            events = self._learn(m, folders)
+            if events:
+                self.reload_rules()  # выученные адреса работают уже в этом проходе
+            self._collect_sent(m, folders)
             dest = {r.move_to: self._ensure_folder(m, folders, r.move_to) for r in self.rules}
             for name, raw in list(folders.items()):
                 if name in self.skip:
@@ -204,16 +258,19 @@ class MailboxSorter:
                 uids, uidvalidity, max_uid = res
                 if uids:
                     plan = {}
-                    for uid, (sender, subject, flag) in self._fetch_headers(m, uids).items():
-                        rule = self.pick_rule(sender, subject, flag)
+                    for uid, h in self._fetch_headers(m, uids).items():
+                        rule = self.pick_rule(h)
                         if rule:
-                            plan.setdefault((rule.move_to, rule.mark_read, rule.name), []).append(uid)
-                    for (move_to, mark_read, rule_name), muids in plan.items():
-                        self._move(m, muids, dest[move_to], mark_read)
-                        moved_total += len(muids)
-                        if self.learn and move_to == self.learn.folder:
+                            plan.setdefault(rule.id or rule.name, (rule, []))[1].append((uid, h.sender))
+                    for rule, items in plan.values():
+                        self._move(m, [u for u, _ in items], dest[rule.move_to], rule.mark_read)
+                        if rule.id:
+                            for sender in {s for _, s in items}:
+                                self.store.touch_seen(rule.id, sender)
+                        moved_total += len(items)
+                        if self.learn and rule.move_to == self.learn.folder:
                             moved_to_learn = True
-                        log.info("[%s] %s: %s -> %s, писем %d", self.login, rule_name, name, move_to, len(muids))
+                        log.info("[%s] %s: %s -> %s, писем %d", self.login, rule.name, name, rule.move_to, len(items))
                 m.close()
                 self.state[raw] = [uidvalidity, max_uid]
             if moved_to_learn:
@@ -223,4 +280,4 @@ class MailboxSorter:
                 m.logout()
             except Exception:
                 pass
-        return moved_total, learned_new
+        return moved_total, events

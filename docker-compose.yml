@@ -1,16 +1,29 @@
+x-common: &common
+  build: .
+  image: mail-sorter:latest
+  restart: unless-stopped
+  env_file: .env
+  volumes:
+    - ./rules.yaml:/app/config/rules.yaml:ro   # только для первичного переноса правил в базу
+    - ./data:/app/data
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
   mail-sorter:
-    build: .
-    image: mail-sorter:latest
+    <<: *common
     container_name: mail-sorter
-    restart: unless-stopped
-    env_file: .env
-    volumes:
-      - ./rules.yaml:/app/config/rules.yaml:ro
-      - ./data:/app/data
     mem_limit: 128m
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
+
+  mail-bot:
+    <<: *common
+    container_name: mail-bot
+    command: ["python", "-m", "app.bot"]
+    environment:
+      HEARTBEAT_NAME: bot_heartbeat
+    mem_limit: 128m
+    depends_on:
+      - mail-sorter

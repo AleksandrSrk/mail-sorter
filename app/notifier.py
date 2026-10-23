@@ -1,22 +1,33 @@
-"""Уведомления о сбоях на почту (с ограничением частоты)."""
+"""Уведомления в Telegram владельцу (ошибки — с ограничением частоты, события — сразу).
+
+Шлём напрямую через Bot API, а не через контейнер бота: ошибка дойдёт, даже если бот лежит."""
 import json
 import logging
 import os
-import smtplib
 import time
-from email.mime.text import MIMEText
+import urllib.request
 
 log = logging.getLogger("notifier")
+API = "https://api.telegram.org/bot{token}/sendMessage"
 
 
 class Notifier:
-    def __init__(self, settings):
+    def __init__(self, settings, transport=None):
         self.s = settings
         self.state_path = os.path.join(settings.data_dir, "notify_state.json")
+        self.transport = transport or self._post
 
     @property
     def enabled(self):
-        return bool(self.s.notify_to and self.s.notify_from and self.s.notify_from in self.s.mailboxes)
+        return bool(self.s.tg_token and self.s.tg_admin)
+
+    def _post(self, text):
+        data = json.dumps({"chat_id": self.s.tg_admin, "text": text,
+                           "disable_web_page_preview": True}).encode()
+        req = urllib.request.Request(API.format(token=self.s.tg_token), data=data,
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            r.read()
 
     def _load(self):
         try:
@@ -31,23 +42,21 @@ class Notifier:
             json.dump(st, f)
         os.replace(tmp, self.state_path)
 
-    def send(self, key: str, subject: str, body: str, force: bool = False) -> bool:
+    def send(self, key: str, subject: str, body: str = "", force: bool = False) -> bool:
+        """key — для ограничения частоты одинаковых сообщений; force — слать без ограничения."""
         if not self.enabled:
             return False
         st = self._load()
         now = time.time()
         if not force and now - st.get(key, 0) < self.s.notify_cooldown:
             return False
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = f"[mail-sorter] {subject}"
-        msg["From"] = self.s.notify_from
-        msg["To"] = self.s.notify_to
+        text = f"📬 mail-sorter: {subject}" + (f"\n\n{body}" if body else "")
+        if len(text) > 4000:
+            text = text[:3990] + "\n…"
         try:
-            with smtplib.SMTP_SSL(self.s.smtp_host, self.s.smtp_port, timeout=60) as smtp:
-                smtp.login(self.s.notify_from, self.s.mailboxes[self.s.notify_from])
-                smtp.sendmail(self.s.notify_from, [self.s.notify_to], msg.as_string())
+            self.transport(text)
         except Exception as e:  # уведомление не должно ронять сервис
-            log.error("не удалось отправить уведомление: %s", e)
+            log.error("не удалось отправить в Telegram: %s", type(e).__name__)
             return False
         st[key] = now
         self._save(st)

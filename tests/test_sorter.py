@@ -1,7 +1,5 @@
 """Инкрементальный обход на фейковом IMAP."""
-from app.config import LearnSpam, Rule
 from app.sorter import MailboxSorter, parse_status
-from app.state import LearnedSpam
 
 
 def test_parse_status():
@@ -58,8 +56,10 @@ class FakeIMAP:
             for u in args[0].split(","):
                 u = int(u)
                 self.fetched.append((self.sel, u))
-                fr, subj, flag = msgs[u]
-                hdr = f"From: {fr}\r\nSubject: {subj}\r\n" + ("X-Spam-Flag: YES\r\n" if flag else "") + "\r\n"
+                fr, subj, flag = msgs[u][:3]
+                lu = msgs[u][3] if len(msgs[u]) > 3 else ""
+                hdr = (f"From: {fr}\r\nSubject: {subj}\r\nTo: {subj}\r\n" + ("X-Spam-Flag: YES\r\n" if flag else "")
+                       + (f"List-Unsubscribe: {lu}\r\n" if lu else "") + "\r\n")
                 out.append((f"{u} (UID {u} BODY[...] {{1}}".encode(), hdr.encode()))
                 out.append(b")")
             return "OK", out
@@ -73,27 +73,31 @@ class FakeIMAP:
         return "OK", []
 
 
-def make(fake, tmp_path, state=None):
-    rules = [Rule(name="Спам", move_to="Junk", senders={"bad@x.ru"}, spam_header=True, learn=True, mark_read=True)]
-    s = MailboxSorter("h", 993, "me@our.ru", "pw", rules, {"Trash"}, state if state is not None else {},
-                      learn=LearnSpam(folder="Junk", never_domains={"our.ru"}), learned=LearnedSpam(str(tmp_path)))
+def make(fake, store, state=None):
+    s = MailboxSorter("h", 993, "me@our.ru", "pw", store, state if state is not None else {}, own_domains={"our.ru"})
     s._connect = lambda: (setattr(s, "caps", {"MOVE"}), fake)[1]
     return s
 
 
-def test_incremental_and_learning(tmp_path):
+def test_incremental_and_learning(store, tmp_path):
     fake = FakeIMAP({
-        "INBOX": {"validity": 1, "msgs": {1: ("bad@x.ru", "a", False), 2: ("ok@y.ru", "b", False),
+        "INBOX": {"validity": 1, "msgs": {1: ("bad@spam.ru", "a", False), 2: ("ok@y.ru", "b", False),
                                            3: ("z@z.ru", "c", True), 4: ("later@s.ru", "d", False)}},
-        "Junk": {"validity": 1, "msgs": {1: ("old@spam.ru", "x", False), 2: ("boss@our.ru", "x", False)}},
-        "Trash": {"validity": 1, "msgs": {1: ("bad@x.ru", "a", False)}},
+        "Junk": {"validity": 1, "msgs": {1: ("fresh@spam.ru", "x", False, "<mailto:u@spam.ru>"),
+                                          2: ("boss@our.ru", "x", False)}},
+        "Удаленные элементы": {"validity": 1, "msgs": {1: ("bad@spam.ru", "a", False)}},
+        "Отправленные": {"validity": 1, "msgs": {1: ("me@our.ru", "client@corp.ru", False)}},
     })
-    s = make(fake, tmp_path)
+    s = make(fake, store)
     moved, new = s.run_once(full=True)
-    assert moved == 2                                  # bad@x.ru + спам-флаг
-    assert new == ["old@spam.ru"]                      # свой домен не обучаем
+    assert moved == 2                                  # bad@spam.ru + спам-флаг
+    assert new == [("fresh@spam.ru", "added")]         # свой домен не обучаем
+    assert [r["sender"] for r in store.pending_unsubs()] == ["fresh@spam.ru"]
     assert sorted(fake.f["INBOX"]["msgs"]) == [2, 4]
-    assert 1 in fake.f["Trash"]["msgs"]                # Trash в skip
+    assert 1 in fake.f["Удаленные элементы"]["msgs"]  # корзину не трогаем
+    assert store.contacts()[0] == {"client@corp.ru": 1}
+    seen = store.one("SELECT last_seen_at FROM entries WHERE value='bad@spam.ru'")["last_seen_at"]
+    assert seen
 
     # второй проход без новых писем — ничего не фетчим
     fake.fetched.clear()
@@ -107,19 +111,35 @@ def test_incremental_and_learning(tmp_path):
     fake.next["INBOX"] = 6
     fake.fetched.clear()
     moved, new = s.run_once()
-    assert new == ["later@s.ru"]
+    assert new == [("later@s.ru", "added")]
     assert moved == 1
     assert ("INBOX", 2) not in fake.fetched            # старые письма не перечитываем
     assert sorted(fake.f["INBOX"]["msgs"]) == [2]
-    assert "later@s.ru" in open(tmp_path / "learned_spam.txt").read()
+    assert store.one("SELECT source FROM entries WHERE value='later@s.ru'")["source"] == "learned"
 
 
-def test_uidvalidity_change_rescans(tmp_path):
+def test_uidvalidity_change_rescans(store):
     fake = FakeIMAP({"INBOX": {"validity": 1, "msgs": {1: ("ok@y.ru", "a", False)}},
                      "Junk": {"validity": 1, "msgs": {}}})
     state = {}
-    s = make(fake, tmp_path, state)
+    s = make(fake, store, state)
     s.run_once(full=True)
-    fake.f["INBOX"] = {"validity": 2, "msgs": {1: ("bad@x.ru", "a", False)}}
+    fake.f["INBOX"] = {"validity": 2, "msgs": {1: ("bad@spam.ru", "a", False)}}
     moved, _ = s.run_once()
     assert moved == 1
+
+
+def test_rules_reloaded_each_run(store):
+    fake = FakeIMAP({"INBOX": {"validity": 1, "msgs": {1: ("x@new.ru", "a", False)}},
+                     "Junk": {"validity": 1, "msgs": {}}})
+    s = make(fake, store)
+    assert s.run_once(full=True)[0] == 0
+    rid = store.learn_rule()["id"]
+    store.add_entry(rid, "addr", "x@new.ru", "bot")                    # добавили через бота
+    assert s.run_once(full=True)[0] == 1
+
+
+def test_own_domain_never_spam_even_with_flag(store):
+    fake = FakeIMAP({"INBOX": {"validity": 1, "msgs": {1: ("colleague@our.ru", "a", True)}},
+                     "Junk": {"validity": 1, "msgs": {}}})
+    assert make(fake, store).run_once(full=True)[0] == 0

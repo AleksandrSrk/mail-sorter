@@ -6,7 +6,7 @@ import time
 data_dir = os.environ.get("DATA_DIR", "/app/data")
 limit = int(os.environ.get("POLL_INTERVAL", "60")) * 5 + 120
 try:
-    with open(os.path.join(data_dir, "heartbeat")) as f:
+    with open(os.path.join(data_dir, os.environ.get("HEARTBEAT_NAME", "heartbeat"))) as f:
         age = time.time() - int(f.read().strip())
 except (OSError, ValueError):
     sys.exit(1)

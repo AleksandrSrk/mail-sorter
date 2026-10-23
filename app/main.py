@@ -8,10 +8,12 @@ import sys
 import time
 import traceback
 
-from .config import load_rules, load_settings
+from .config import load_settings
+from .db import Store
 from .notifier import Notifier
 from .sorter import MailboxSorter
-from .state import LearnedSpam, StateStore
+from .state import StateStore
+from .unsub import unsubscribe
 
 STOP = False
 
@@ -39,6 +41,24 @@ def heartbeat(data_dir):
         f.write(str(int(time.time())))
 
 
+def process_unsubs(store, settings, notifier, log):
+    """Очередь отписок + перевод в «отписанные» после недели тишины."""
+    try:
+        for row in store.pending_unsubs():
+            ok, result = unsubscribe(row, settings)
+            store.finish_unsub(row["id"], ok, result)
+            log.info("отписка от %s (%s): %s", row["sender"], row["mailbox"], result)
+            notifier.send(f"unsub:{row['id']}", ("📭 отписался от " if ok else "⚠️ не смог отписаться от ")
+                          + row["sender"], f"Ящик: {row['mailbox']}\n{result}", force=True)
+        for sender in store.expire_unsubscribing(settings.unsub_quiet_days):
+            log.info("%s: неделя тишины, снят с фильтра", sender)
+            notifier.send(f"quiet:{sender}", f"🔕 {sender}: тишина {settings.unsub_quiet_days} дн. после отписки — "
+                          "снят со спам-фильтра, лежит в «Отписанных»", force=True)
+    except Exception as e:
+        log.error("ошибка в обработке отписок: %s", e)
+        notifier.send(f"err:unsub:{type(e).__name__}", "❌ ошибка в отписках", f"{e}\n\n{traceback.format_exc()[-2500:]}")
+
+
 def main():
     settings = load_settings()
     setup_logging(settings.data_dir)
@@ -48,28 +68,20 @@ def main():
     notifier = Notifier(settings)
     socket.setdefaulttimeout(180)
 
-    loaded = load_rules(settings.rules_file, list(settings.mailboxes))
-    unknown = [mb for mb in loaded["boxes"] if mb not in settings.mailboxes]
-    if unknown:
-        log.warning("в правилах есть ящики без пароля в MAILBOXES: %s", ", ".join(unknown))
-    learn = loaded["learn"]
-    active = {mb: c for mb, c in loaded["boxes"].items() if mb in settings.mailboxes and (c["rules"] or learn)}
+    store = Store(settings.db_path)
+    if store.seed(settings.rules_file, os.path.join(settings.data_dir, "learned_spam.txt")):
+        log.info("правила перенесены в базу из %s", settings.rules_file)
     state = StateStore(settings.data_dir)
-    learned = LearnedSpam(settings.data_dir)
-    log.info("старт: ящиков в env %d, в работе %d, интервал %d с, обучение спаму: %s, адресов в обученном списке %d",
-             len(settings.mailboxes), len(active), settings.poll_interval,
-             learn.folder if learn else "выкл", len(learned.items))
-    for mb, conf in active.items():
-        log.info("  %s: правил %d (%s)", mb, len(conf["rules"]), ", ".join(r.name for r in conf["rules"]))
+    rules_count = store.one("SELECT count(*) AS n FROM rules WHERE enabled=1")["n"]
+    log.info("старт: ящиков %d, правил в базе %d, интервал %d с, уведомления в Telegram: %s",
+             len(settings.mailboxes), rules_count, settings.poll_interval, "да" if notifier.enabled else "НЕТ")
 
     sorters = {
-        mb: MailboxSorter(settings.imap_host, settings.imap_port, mb, settings.mailboxes[mb],
-                          conf["rules"], conf["skip"], state.box(mb), learn=learn, learned=learned)
-        for mb, conf in active.items()
+        mb: MailboxSorter(settings.imap_host, settings.imap_port, mb, pw, store, state.box(mb),
+                          own_domains=settings.own_domains)
+        for mb, pw in settings.mailboxes.items()
     }
-    notifier.send("start", "запущен",
-                  "Сервис запущен.\n" + "\n".join(f"{mb}: {', '.join(r.name for r in c['rules'])}"
-                                                   for mb, c in active.items()))
+    notifier.send("start", "запущен", f"Ящиков: {len(sorters)}, правил: {rules_count}")
     failing = set()
     need_full = set(sorters)  # при старте — полный проход по всем ящикам
     while not STOP:
@@ -79,14 +91,13 @@ def main():
             log.info("ночной полный проход")
             need_full = set(sorters)
             state.data["last_full_day"] = today
-        learned.reload()
         for mb, sorter in sorters.items():
             if STOP:
                 break
             full = mb in need_full
             try:
                 t0 = time.time()
-                moved, new_spam = sorter.run_once(full=full)
+                moved, events = sorter.run_once(full=full)
                 state.save()
                 if full:
                     need_full.discard(mb)
@@ -96,13 +107,15 @@ def main():
                 if mb in failing:
                     failing.discard(mb)
                     log.info("[%s] снова работает", mb)
-                    notifier.send(f"ok:{mb}", f"{mb}: снова работает", f"Ящик {mb} снова обрабатывается.", force=True)
+                    notifier.send(f"ok:{mb}", f"✅ {mb}: снова работает", force=True)
             except Exception as e:
                 state.save()
                 failing.add(mb)
                 log.error("[%s] ошибка: %s", mb, e)
-                notifier.send(f"err:{mb}:{type(e).__name__}", f"ошибка в {mb}",
-                              f"Ящик: {mb}\nОшибка: {e}\n\n{traceback.format_exc()}")
+                notifier.send(f"err:{mb}:{type(e).__name__}", f"❌ ошибка в {mb}",
+                              f"{e}\n\n{traceback.format_exc()[-2500:]}")
+        if not STOP:
+            process_unsubs(store, settings, notifier, log)
         heartbeat(settings.data_dir)
         delay = max(5, settings.poll_interval - (time.time() - started))
         while delay > 0 and not STOP:
