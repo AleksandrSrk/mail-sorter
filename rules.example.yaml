@@ -1,14 +1,33 @@
 # Пример правил. Рабочий файл rules.yaml лежит только на сервере (в .gitignore).
 #
+# Блок `_all` — общие правила для ВСЕХ ящиков из MAILBOXES, проверяются раньше правил ящика.
 # Ящик -> список правил. Правила проверяются по порядку, срабатывает первое подходящее.
 # Условия (любое из):
 #   from:             точные адреса отправителей
 #   from_domain:      домены отправителей
 #   subject_contains: подстроки в теме (без учёта регистра)
+#   spam_header:      серверная метка спама (X-Spam-Flag / X-Spam-Status: yes)
+#   learn:            адреса из обученного спам-списка (data/learned_spam.txt)
 # Действия:
 #   move_to:   папка назначения (создастся, если её нет)
 #   mark_read: пометить прочитанным (по умолчанию false)
 # skip_folders: папки, которые не трогаем (корзина, спам и черновики пропускаются всегда)
+
+_all:
+  rules:
+    - name: Спам
+      from: [promo@spam.example, news@mailer.example]
+      from_domain: [junk.example]
+      spam_header: true
+      learn: true
+      move_to: Нежелательная почта
+      mark_read: true
+  # Обучение: отправители писем, которые вы сами кидаете в эту папку (с любого
+  # устройства), попадают в data/learned_spam.txt и дальше уходят в спам везде.
+  # Свои домены (из MAILBOXES) в список не попадают никогда.
+  learn_spam:
+    folder: Нежелательная почта
+    never: [friend@gmail.example, "@partner.example"]   # белый список: адреса и домены
 
 sales@example.ru:
   rules:
