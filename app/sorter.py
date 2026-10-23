@@ -383,6 +383,18 @@ class MailboxSorter:
                 m.close()
             self.store.notice_progress(n["id"], self.login, info)
 
+    # ---------- сколько писем от кого в ящике ----------
+    def _count_senders(self, m, raw) -> Counter:
+        """Все отправители папки (только заголовки From и т.п.) — для счётчика «от него» в проверке адреса."""
+        typ, _ = m.select(_quote(raw), readonly=True)
+        if typ != "OK":
+            return Counter()
+        typ, d = m.uid("SEARCH", None, "UID", "1:*")
+        uids = d[0].split() if typ == "OK" and d and d[0] else []
+        out = Counter(h.sender for h in self._fetch_headers(m, uids).values()) if uids else Counter()
+        m.close()
+        return out
+
     # ---------- «где его письма» ----------
     LOOKUP_LETTERS = 5      # последних его и наших писем с ящика — для сводки нейронкой по кнопке
 
@@ -465,6 +477,13 @@ class MailboxSorter:
             self._restores(m, folders)
             self._collect_sent(m, folders)
             dest = {r.move_to: self._ensure_folder(m, folders, r.move_to) for r in self.rules}
+            # счётчик «от него» по ящику: при полном проходе — точный пересчёт. Папки, куда мы сами
+            # раскладываем, считаем ДО раскладки — иначе перенесённое письмо посчитается дважды
+            incoming = Counter()
+            if full:
+                for name, raw in folders.items():
+                    if name in self.skip and name != SENT_FOLDER:
+                        incoming += self._count_senders(m, raw)
             for name, raw in list(folders.items()):
                 if name in self.skip:
                     continue
@@ -474,7 +493,12 @@ class MailboxSorter:
                 uids, uidvalidity, max_uid = res
                 if uids:
                     plan, flagged = {}, []
-                    for uid, h in self._fetch_headers(m, uids).items():
+                    hdrs = self._fetch_headers(m, uids)
+                    if full and name != SENT_FOLDER:
+                        incoming.update(h.sender for h in hdrs.values())
+                    elif name == "INBOX":          # днём — только новые входящие, ручные переносы не считаем
+                        self.store.add_box_incoming(self.login, [h.sender for h in hdrs.values()])
+                    for uid, h in hdrs.items():
                         rule = self.pick_rule(h)
                         if rule:
                             plan.setdefault(rule.id or rule.name, (rule, []))[1].append((uid, h.sender))
@@ -494,6 +518,8 @@ class MailboxSorter:
                         log.info("[%s] %s: %s -> %s, писем %d", self.login, rule.name, name, rule.move_to, len(items))
                 m.close()
                 self.state[raw] = [uidvalidity, max_uid]
+            if full:
+                self.store.replace_box_incoming(self.login, incoming)
             targets = self._targets()
             if full:
                 self.state[self.SWEPT_KEY] = sorted(targets)   # полный проход уже всё перебрал

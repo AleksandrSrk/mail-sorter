@@ -337,3 +337,27 @@ def test_lookup_keeps_five_newest_and_unsubscribe_header(store):
     info = store.ready_lookups(["me@our.ru"])[0]["boxes"]["me@our.ru"]
     assert [x["subject"] for x in info["letters"]] == [f"Письмо {u}" for u in (8, 7, 6, 5, 4)]
     assert info["lu"] == "<mailto:u8@shop.ru>"                         # из самого свежего письма
+
+
+def test_incoming_counts_full_pass_then_inbox_only(store):
+    fake = FakeIMAP({
+        "INBOX": {"validity": 1, "msgs": {1: ("bad@spam.ru", "a", False), 2: ("p@corp.ru", "b", False),
+                                           3: ("p@corp.ru", "c", False)}},
+        "Archive": {"validity": 1, "msgs": {1: ("p@corp.ru", "d", False)}},
+        "Junk": {"validity": 1, "msgs": {1: ("bad@spam.ru", "old", False)}},
+        "Удаленные элементы": {"validity": 1, "msgs": {1: ("p@corp.ru", "e", False)}},
+        "Отправленные": {"validity": 1, "msgs": {1: ("me@our.ru", "p@corp.ru", False)}},
+    })
+    s = make(fake, store)
+    s.run_once(full=True)
+    assert store.box_incoming("p@corp.ru") == {"me@our.ru": 4}          # все папки, включая корзину
+    assert store.box_incoming("bad@spam.ru") == {"me@our.ru": 2}        # перенесённое в спам — не дважды
+    assert store.box_incoming("me@our.ru") == {}                        # «Отправленные» не считаем
+    fake.f["INBOX"]["msgs"][9] = ("p@corp.ru", "новое", False)
+    fake.next["INBOX"] = 10
+    fake.f["Archive"]["msgs"][5] = fake.f["INBOX"]["msgs"].pop(2)        # пользователь сам перенёс в архив
+    fake.next["Archive"] = 6
+    s.run_once()
+    assert store.box_incoming("p@corp.ru") == {"me@our.ru": 5}          # +1 новое, ручной перенос не считаем
+    s.run_once(full=True)
+    assert store.box_incoming("p@corp.ru") == {"me@our.ru": 5}          # ночной пересчёт — то же самое

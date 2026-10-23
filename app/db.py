@@ -66,6 +66,12 @@ CREATE TABLE IF NOT EXISTS contact_boxes(
     sent INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY(address, mailbox)
 );
+CREATE TABLE IF NOT EXISTS inbox_counts(
+    address TEXT NOT NULL,        -- сколько писем от него лежит в ящике (все папки, кроме «Отправленных»)
+    mailbox TEXT NOT NULL,        -- точно — после полного прохода, днём + новые во «Входящих»
+    n INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(address, mailbox)
+);
 CREATE TABLE IF NOT EXISTS lookups(
     id INTEGER PRIMARY KEY,
     address TEXT NOT NULL,        -- «где его письма» — запрос из проверки адреса в боте
@@ -509,6 +515,33 @@ class Store:
             if "@" in a:
                 self.x("INSERT INTO contact_boxes(address, mailbox, sent) VALUES(?, ?, 1) "
                        "ON CONFLICT(address, mailbox) DO UPDATE SET sent=sent+1", a, mailbox)
+
+    def replace_box_incoming(self, mailbox, counts):
+        """Полный проход: точный пересчёт писем по отправителям в ящике."""
+        self.x("BEGIN")
+        try:
+            self.x("DELETE FROM inbox_counts WHERE mailbox=?", mailbox)
+            self.db.executemany("INSERT INTO inbox_counts(address, mailbox, n) VALUES(?,?,?)",
+                                [(a, mailbox, n) for a, n in counts.items() if "@" in a])
+            self.x("COMMIT")
+        except Exception:
+            self.x("ROLLBACK")
+            raise
+        self.set_meta("inbox_counts:" + mailbox, now_iso())
+
+    def add_box_incoming(self, mailbox, senders):
+        for a in senders:
+            if "@" in a:
+                self.x("INSERT INTO inbox_counts(address, mailbox, n) VALUES(?, ?, 1) "
+                       "ON CONFLICT(address, mailbox) DO UPDATE SET n=n+1", a, mailbox)
+
+    def box_incoming(self, address) -> dict:
+        """{ящик: сколько писем от него там лежит}"""
+        return {r["mailbox"]: r["n"] for r in
+                self.q("SELECT mailbox, n FROM inbox_counts WHERE address=? AND n>0", _norm_addr(address))}
+
+    def incoming_counted(self) -> bool:
+        return bool(self.one("SELECT 1 FROM meta WHERE key LIKE 'inbox_counts:%'"))
 
     def box_contacts(self, address) -> dict:
         """{ящик: сколько раз мы ему писали из этого ящика}"""

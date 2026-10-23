@@ -270,12 +270,15 @@ def check_screen(store, addr: str, own_domains=()):
                 mark = {"done": "✅", "failed": "❌"}.get(u["status"], "⏳")
                 lines.append(f"   отписка {mark} {u['mailbox']}: {u['result'] or 'в очереди'}")
     sent = store.one("SELECT sent FROM contacts WHERE address=?", addr)
-    if sent:
-        boxes = store.box_contacts(addr)
-        lines.append(f"Мы ему писали: {letters(sent['sent'])}" + ("" if boxes else " (по ящикам — после ближайшего прохода)"))
-        lines += [f"  • {_short_box(mb)} — {n}" for mb, n in sorted(boxes.items(), key=lambda x: (-x[1], x[0]))]
+    inc, out = store.box_incoming(addr), store.box_contacts(addr)
+    boxes = sorted(set(inc) | set(out), key=lambda mb: (-(inc.get(mb, 0) + out.get(mb, 0)), mb))
+    if boxes:
+        lines.append(f"Письма по ящикам (от него / от нас): {sum(inc.values())} / {sum(out.values())}")
+        lines += [f"  • {_short_box(mb)} — {inc.get(mb, 0)} / {out.get(mb, 0)}" for mb in boxes]
     else:
-        lines.append("Мы ему не писали.")
+        lines.append("Писем от него и к нему нет.")
+    if not store.incoming_counted():
+        lines.append("(входящие посчитаются после ближайшего полного прохода)")
     buttons = []
     own_addr_rules = {e["rule_id"] for e in rows if e["kind"] == "addr"}
     for e in rows:

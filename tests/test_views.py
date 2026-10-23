@@ -94,18 +94,21 @@ def test_check_address_everywhere(store):
     t = views.check_address(store, "n@x.ru")
     assert "«Спам»: адрес — 📭 в фильтре, отписались" in t and "отписка ✅ box@our.ru: письмо на u@x.ru" in t
     t = views.check_address(store, "robot@bank.ru")
-    assert "«БАНК»: адрес — 🔴 в фильтре" in t and "Мы ему не писали." in t
+    assert "«БАНК»: адрес — 🔴 в фильтре" in t and "Писем от него и к нему нет." in t
     t = views.check_address(store, "p@mail.ru")
     assert "«Партнёр» (только box@our.ru)" in t
     t = views.check_address(store, "any@junk.example")
     assert "весь домен @junk.example" in t
     store.add_contacts(["nobody@corp.ru"])
     t = views.check_address(store, "nobody@corp.ru", own_domains={"our.ru"})
-    assert "Ни в одном списке нет." in t and "писали: 1 письмо (по ящикам — после ближайшего прохода)" in t
+    assert "Ни в одном списке нет." in t and "(входящие посчитаются после ближайшего полного прохода)" in t
     store.add_box_contacts(["nobody@corp.ru"] * 3, "b@our.ru")
     store.add_box_contacts(["nobody@corp.ru"] * 2, "a@our.ru")
+    store.replace_box_incoming("a@our.ru", {"nobody@corp.ru": 7, "other@corp.ru": 1})
+    store.add_box_incoming("c@our.ru", ["nobody@corp.ru"])
     t = views.check_address(store, "nobody@corp.ru", own_domains={"our.ru"})
-    assert "писали: 1 письмо\n  • b@our — 3\n  • a@our — 2" in t
+    assert ("Письма по ящикам (от него / от нас): 8 / 5\n  • a@our — 7 / 2\n  • b@our — 0 / 3\n"
+            "  • c@our — 1 / 0\n🛡") in t and "посчитаются" not in t
     assert "Свой домен" in views.check_address(store, "boss@our.ru", own_domains={"our.ru"})
 
 
