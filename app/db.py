@@ -6,6 +6,7 @@
   unsubscribed  — отписались, из фильтра снята
   removed       — снята из фильтра вручную (бот / белый список)
 """
+import json
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -57,6 +58,14 @@ CREATE TABLE IF NOT EXISTS domains(
 CREATE TABLE IF NOT EXISTS contacts(
     address TEXT PRIMARY KEY,
     sent INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS reports(
+    id INTEGER PRIMARY KEY,
+    sender TEXT NOT NULL,
+    mailbox TEXT,                 -- где кинули в спам
+    action TEXT,                  -- added / returned
+    boxes TEXT NOT NULL DEFAULT '{}',  -- {ящик: сколько старых писем перенесено}
+    created_at TEXT, done_at TEXT
 );
 CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
 """
@@ -191,6 +200,45 @@ class Store:
         for r in rows:
             self.x("UPDATE entries SET status='unsubscribed', updated_at=? WHERE id=?", now_iso(now), r["id"])
         return [r["value"] for r in rows]
+
+    # ---------- отчёты о новых адресах в спам-фильтре ----------
+    def open_report(self, sender, mailbox, action, now=None):
+        if not self.one("SELECT 1 FROM reports WHERE sender=? AND done_at IS NULL", sender):
+            self.x("INSERT INTO reports(sender, mailbox, action, created_at) VALUES(?,?,?,?)",
+                   sender, mailbox, action, now_iso(now))
+
+    def has_open_report(self, sender) -> bool:
+        return bool(self.one("SELECT 1 FROM reports WHERE sender=? AND done_at IS NULL", sender))
+
+    def report_progress(self, mailbox, swept_keys, rule_id, moved_by_sender):
+        """Ящик прочесал старую почту по адресу — записываем, сколько писем перенёс."""
+        for r in self.q("SELECT id, sender, boxes FROM reports WHERE done_at IS NULL"):
+            boxes = json.loads(r["boxes"])
+            if mailbox not in boxes and f"{rule_id}:a:{r['sender']}" in swept_keys:
+                boxes[mailbox] = moved_by_sender.get(r["sender"], 0)
+                self.x("UPDATE reports SET boxes=? WHERE id=?", json.dumps(boxes, ensure_ascii=False), r["id"])
+
+    def ready_reports(self, mailboxes, timeout_min=30, now=None):
+        """Отчёты, по которым отметились все ящики (или вышел таймаут) и отписка уже отработала."""
+        now = now or datetime.now(timezone.utc)
+        out = []
+        for r in self.q("SELECT * FROM reports WHERE done_at IS NULL ORDER BY id"):
+            boxes = json.loads(r["boxes"])
+            timed_out = r["created_at"] < now_iso(now - timedelta(minutes=timeout_min))
+            entry = self.one("SELECT e.id, e.no_unsub FROM entries e JOIN rules ru ON ru.id=e.rule_id "
+                             "WHERE ru.learn=1 AND e.kind='addr' AND e.value=?", r["sender"])
+            unsubs = self.q("SELECT mailbox, status, result FROM unsubs WHERE entry_id=? ORDER BY id",
+                            entry["id"]) if entry else []
+            if any(u["status"] == "pending" for u in unsubs) and not timed_out:
+                continue
+            if set(mailboxes) <= set(boxes) or timed_out:
+                out.append({"id": r["id"], "sender": r["sender"], "mailbox": r["mailbox"], "action": r["action"],
+                            "boxes": boxes, "missing": sorted(set(mailboxes) - set(boxes)),
+                            "unsubs": [dict(u) for u in unsubs], "no_unsub": bool(entry and entry["no_unsub"])})
+        return out
+
+    def close_report(self, report_id, now=None):
+        self.x("UPDATE reports SET done_at=? WHERE id=?", now_iso(now), report_id)
 
     # ---------- contacts (для оценки полезности) ----------
     def add_contacts(self, addresses):

@@ -166,3 +166,17 @@ def test_new_address_sweeps_old_letters(store):
     assert {n for _, n in fake.searches} == {"old@veles.ru", "@newdom.ru"}
     fake.searches.clear()
     assert s.run_once()[0] == 0 and fake.searches == []             # второй раз по тем же не ищем
+
+
+def test_returned_address_is_swept_again(store):
+    fake = FakeIMAP({"INBOX": {"validity": 1, "msgs": {}}, "Junk": {"validity": 1, "msgs": {}}})
+    s = make(fake, store)
+    s.run_once(full=True)
+    store.x("UPDATE entries SET status='removed' WHERE value='bad@spam.ru'")   # «не спам» в боте
+    s.run_once()
+    fake.f["INBOX"]["msgs"][1] = ("bad@spam.ru", "old", False)                # письмо уже лежит
+    fake.next["INBOX"] = 2
+    s.run_once()                                                              # пришло как новое — не спам
+    assert 1 in fake.f["INBOX"]["msgs"]
+    store.x("UPDATE entries SET status='active' WHERE value='bad@spam.ru'")    # вернули в фильтр
+    assert s.run_once()[0] == 1                                               # старое письмо найдено заново

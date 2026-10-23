@@ -5,7 +5,7 @@ import email.utils
 import imaplib
 import logging
 import re
-from collections import namedtuple
+from collections import Counter, namedtuple
 
 from . import imap_utf7
 from .config import DEFAULT_SKIP_FOLDERS, LearnSpam, Rule
@@ -64,6 +64,7 @@ class MailboxSorter:
         self.rules: list[Rule] = []
         self.learn: LearnSpam | None = None
         self.skip = set(DEFAULT_SKIP_FOLDERS)
+        self.moved_by_sender = Counter()  # сколько писем каждого отправителя перенесено за проход
 
     def reload_rules(self):
         """Правила читаются из базы перед каждым проходом — правки из бота применяются через минуту."""
@@ -201,6 +202,7 @@ class MailboxSorter:
                     action = self.store.learn(h.sender, self.login, h.lu, h.lup)
                     if action:
                         events.append((h.sender, action))
+                        self.store.open_report(h.sender, self.login, action)
             for sender, action in events:
                 log.info("[%s] спам-фильтр: %s %s", self.login,
                          "добавлен" if action == "added" else "возвращён", sender)
@@ -265,9 +267,11 @@ class MailboxSorter:
                 for uid, h in self._fetch_headers(m, sorted(found, key=int)).items():
                     rule = self.pick_rule(h)
                     if rule:
-                        plan.setdefault(rule.id or rule.name, (rule, []))[1].append(uid)
-                for rule, uids in plan.values():
+                        plan.setdefault(rule.id or rule.name, (rule, []))[1].append((uid, h.sender))
+                for rule, items in plan.values():
+                    uids = [u for u, _ in items]
                     self._move(m, uids, dest[rule.move_to], rule.mark_read)
+                    self.moved_by_sender.update(sender for _, sender in items)
                     moved += len(uids)
                     to_learn |= bool(self.learn and rule.move_to == self.learn.folder)
                     log.info("[%s] %s (новые адреса, старые письма): %s -> %s, писем %d",
@@ -284,6 +288,7 @@ class MailboxSorter:
             return 0, []
         moved_total = 0
         moved_to_learn = False
+        self.moved_by_sender = Counter()
         m = self._connect()
         try:
             folders = self._folders(m)
@@ -311,6 +316,7 @@ class MailboxSorter:
                             for sender in {s for _, s in items}:
                                 self.store.touch_seen(rule.id, sender)
                         moved_total += len(items)
+                        self.moved_by_sender.update(sender for _, sender in items)
                         if self.learn and rule.move_to == self.learn.folder:
                             moved_to_learn = True
                         log.info("[%s] %s: %s -> %s, писем %d", self.login, rule.name, name, rule.move_to, len(items))
@@ -320,7 +326,9 @@ class MailboxSorter:
             if full:
                 self.state[self.SWEPT_KEY] = sorted(targets)   # полный проход уже всё перебрал
             else:
-                swept = set(self.state.get(self.SWEPT_KEY, []))
+                # снятые с фильтра забываем — если вернут, старые письма прочешем заново
+                swept = set(self.state.get(self.SWEPT_KEY, [])) & set(targets)
+                self.state[self.SWEPT_KEY] = sorted(swept)
                 fresh = [k for k in targets if k not in swept]
                 if fresh:
                     n, to_learn = self._sweep(m, folders, dest, sorted({targets[k] for k in fresh}))
@@ -329,6 +337,10 @@ class MailboxSorter:
                     self.state[self.SWEPT_KEY] = sorted(swept | set(fresh))
             if moved_to_learn:
                 self._skip_own_moves(m, folders)
+            lr = next((r for r in self.rules if r.learn), None)
+            if lr:
+                self.store.report_progress(self.login, set(self.state.get(self.SWEPT_KEY, [])), lr.id,
+                                           self.moved_by_sender)
         finally:
             try:
                 m.logout()

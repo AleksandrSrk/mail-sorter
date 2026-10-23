@@ -48,6 +48,8 @@ def process_unsubs(store, settings, notifier, log):
             ok, result = unsubscribe(row, settings)
             store.finish_unsub(row["id"], ok, result)
             log.info("отписка от %s (%s): %s", row["sender"], row["mailbox"], result)
+            if store.has_open_report(row["sender"]):
+                continue  # результат уйдёт в общем отчёте по адресу
             notifier.send(f"unsub:{row['id']}", ("📭 отписался от " if ok else "⚠️ не смог отписаться от ")
                           + row["sender"], f"Ящик: {row['mailbox']}\n{result}", force=True)
         for sender in store.expire_unsubscribing(settings.unsub_quiet_days):
@@ -57,6 +59,50 @@ def process_unsubs(store, settings, notifier, log):
     except Exception as e:
         log.error("ошибка в обработке отписок: %s", e)
         notifier.send(f"err:unsub:{type(e).__name__}", "❌ ошибка в отписках", f"{e}\n\n{traceback.format_exc()[-2500:]}")
+
+
+def format_report(r) -> str:
+    if r["action"] == "returned":
+        head = f"↩️ Снова в спам-фильтре: {r['sender']}"
+    else:
+        head = f"🚫 В спам-фильтр добавлен: {r['sender']}"
+    lines = [head, f"Кинули в спам в ящике: {r['mailbox']}", ""]
+    moved = {mb: n for mb, n in r["boxes"].items() if n}
+    total = sum(moved.values())
+    if total:
+        lines.append(f"Старые письма перенесены в спам: {total}")
+        lines += [f"  • {mb} — {n}" for mb, n in sorted(moved.items(), key=lambda x: -x[1])]
+        rest = len(r["boxes"]) - len(moved)
+        if rest:
+            lines.append(f"В остальных {rest} ящиках писем от него не было.")
+    else:
+        lines.append(f"Других писем от него ни в одном из {len(r['boxes'])} ящиков не было.")
+    if r["missing"]:
+        lines.append("⚠️ Не проверены (ящик недоступен): " + ", ".join(r["missing"]))
+    lines.append("")
+    if r["no_unsub"]:
+        lines.append("Отписка: не делаем — от него уже отписывались, теперь он в фильтре навсегда.")
+    elif not r["unsubs"]:
+        lines.append("Отписка: ➖ в письме нет заголовка для отписки — автоматически нельзя.")
+    else:
+        lines.append("Отписка:")
+        for u in r["unsubs"]:
+            mark = {"done": "✅", "failed": "❌"}.get(u["status"], "⏳")
+            lines.append(f"  {mark} {u['mailbox']} — {u['result'] or 'в очереди'}")
+    return "\n".join(lines)
+
+
+def send_reports(store, settings, notifier, log):
+    """Сводка по каждому новому адресу: сколько старых писем и где перенесено, чем кончилась отписка."""
+    try:
+        for r in store.ready_reports(list(settings.mailboxes)):
+            text = format_report(r)
+            log.info("отчёт: %s", text.replace("\n", " | "))
+            if notifier.send(f"report:{r['id']}", text, force=True) or not notifier.enabled:
+                store.close_report(r["id"])
+    except Exception as e:
+        log.error("ошибка в отчётах: %s", e)
+        notifier.send(f"err:report:{type(e).__name__}", "❌ ошибка в отчётах", f"{e}\n\n{traceback.format_exc()[-2500:]}")
 
 
 def main():
@@ -116,6 +162,7 @@ def main():
                               f"{e}\n\n{traceback.format_exc()[-2500:]}")
         if not STOP:
             process_unsubs(store, settings, notifier, log)
+            send_reports(store, settings, notifier, log)
         heartbeat(settings.data_dir)
         delay = max(5, settings.poll_interval - (time.time() - started))
         while delay > 0 and not STOP:
