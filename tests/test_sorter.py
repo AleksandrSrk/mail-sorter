@@ -17,6 +17,7 @@ class FakeIMAP:
         self.next = {n: max(d["msgs"] or {0: 0}) + 1 for n, d in folders.items()}
         self.fetched = []
         self.searches = []
+        self.stores = []
 
     def capability(self):
         return "OK", [b"IMAP4rev1 MOVE"]
@@ -68,6 +69,9 @@ class FakeIMAP:
                 out.append((f"{u} (UID {u} BODY[...] {{1}}".encode(), hdr.encode()))
                 out.append(b")")
             return "OK", out
+        if cmd == "STORE":
+            self.stores.append((self.sel, args[0], args[2]))
+            return "OK", []
         if cmd == "MOVE":
             dest = args[1].strip('"')
             for u in args[0].split(","):
@@ -180,3 +184,71 @@ def test_returned_address_is_swept_again(store):
     assert 1 in fake.f["INBOX"]["msgs"]
     store.x("UPDATE entries SET status='active' WHERE value='bad@spam.ru'")    # вернули в фильтр
     assert s.run_once()[0] == 1                                               # старое письмо найдено заново
+
+
+def add_folder_rules(store):
+    bank = store.add_rule("*", "БАНК", "БАНК", learn=True, position=50)
+    disl = store.add_rule("*", "ДИСЛОКАЦИЯ", "ДИСЛОКАЦИЯ", learn=True, position=60)
+    return bank, disl
+
+
+def test_learn_into_bank_moves_everywhere_unread(store):
+    add_folder_rules(store)
+    fake = FakeIMAP({"INBOX": {"validity": 1, "msgs": {1: ("robot@bank.ru", "выписка", False),
+                                                       2: ("ok@y.ru", "b", False)}},
+                     "Archive": {"validity": 1, "msgs": {1: ("robot@bank.ru", "старая", False)}},
+                     "БАНК": {"validity": 1, "msgs": {}}, "ДИСЛОКАЦИЯ": {"validity": 1, "msgs": {}},
+                     "Junk": {"validity": 1, "msgs": {}}})
+    s = make(fake, store)
+    s.run_once(full=True)
+    # пользователь положил письмо банка в БАНК
+    fake.f["БАНК"]["msgs"][1] = fake.f["INBOX"]["msgs"].pop(1)
+    fake.next["БАНК"] = 2
+    moved, events = s.run_once()
+    assert events == [("robot@bank.ru", "added")]
+    assert moved == 1 and fake.f["Archive"]["msgs"] == {}         # старое из архива — тоже в БАНК
+    assert sorted(fake.f["БАНК"]["msgs"]) == [1, 2]
+    assert not any("Seen" in flags for _, _, flags in fake.stores)  # прочитанными не помечаем
+    assert store.pending_unsubs() == []                            # никаких отписок для БАНКА
+    # своё же перемещение в БАНК не считается обучением
+    fake.f["INBOX"]["msgs"][3] = ("robot@bank.ru", "новая", False)
+    fake.next["INBOX"] = 4
+    assert s.run_once() == (1, [])
+
+
+def test_last_word_wins_between_folders(store):
+    bank, _ = add_folder_rules(store)
+    store.learn("x@shop.ru", "me@our.ru")                          # в спаме
+    assert store.learn("x@shop.ru", "me@our.ru", rule_id=bank) == "added"
+    rules = {r.name: r for r in store.rules_for("me@our.ru")}
+    assert "x@shop.ru" not in rules["Спам"].senders and "x@shop.ru" in rules["БАНК"].senders
+    assert store.learn("x@shop.ru", "me@our.ru") == "returned"     # передумал — снова спам
+    rules = {r.name: r for r in store.rules_for("me@our.ru")}
+    assert "x@shop.ru" in rules["Спам"].senders and "x@shop.ru" not in rules["БАНК"].senders
+
+
+def test_own_domain_not_learned_but_manual_works(store):
+    _, disl = add_folder_rules(store)
+    fake = FakeIMAP({"INBOX": {"validity": 1, "msgs": {1: ("disp@our.ru", "дисл", False)}},
+                     "ДИСЛОКАЦИЯ": {"validity": 1, "msgs": {1: ("boss@our.ru", "x", False)}},
+                     "БАНК": {"validity": 1, "msgs": {}}, "Junk": {"validity": 1, "msgs": {}}})
+    s = make(fake, store)
+    assert s.run_once(full=True) == (0, [])                       # boss@our.ru не выучен
+    store.add_entry(disl, "addr", "disp@our.ru", "manual")         # disp@ — руками
+    assert s.run_once()[0] == 1 and 1 not in fake.f["INBOX"]["msgs"]
+
+
+def test_mailbox_rule_beats_learned_folder(store):
+    _, disl = add_folder_rules(store)
+    store.add_entry(disl, "addr", "p@mail.ru", "learned")          # контрагент ПУЯНГа выучен в ДИСЛОКАЦИЮ
+    rules = store.rules_for("box@our.ru")
+    assert [r.name for r in rules] == ["Спам", "Партнёр", "БАНК", "ДИСЛОКАЦИЯ"]
+
+
+def test_existing_folder_content_is_learned_on_start(store):
+    add_folder_rules(store)
+    fake = FakeIMAP({"INBOX": {"validity": 1, "msgs": {1: ("robot@disl.ru", "a", False)}},
+                     "ДИСЛОКАЦИЯ": {"validity": 1, "msgs": {1: ("robot@disl.ru", "old", False)}},
+                     "БАНК": {"validity": 1, "msgs": {}}, "Junk": {"validity": 1, "msgs": {}}})
+    moved, events = make(fake, store).run_once(full=True)
+    assert events == [("robot@disl.ru", "added")] and moved == 1

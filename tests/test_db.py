@@ -103,3 +103,24 @@ def test_unsub_once_per_mailbox(store):
     store.learn("news@legit.ru", "a@our.ru", "<mailto:u@legit.ru>")
     store.learn("news@legit.ru", "b@our.ru", "<mailto:u@legit.ru>")
     assert sorted(r["mailbox"] for r in store.pending_unsubs()) == ["a@our.ru", "b@our.ru"]
+
+
+def test_migration_of_old_db(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    db = sqlite3.connect(path)
+    db.executescript("""CREATE TABLE rules(id INTEGER PRIMARY KEY, mailbox TEXT NOT NULL, name TEXT NOT NULL,
+        move_to TEXT NOT NULL, mark_read INTEGER NOT NULL DEFAULT 0, spam_header INTEGER NOT NULL DEFAULT 0,
+        learn INTEGER NOT NULL DEFAULT 0, position INTEGER NOT NULL DEFAULT 100, enabled INTEGER NOT NULL DEFAULT 1,
+        UNIQUE(mailbox, name));
+        CREATE TABLE reports(id INTEGER PRIMARY KEY, sender TEXT NOT NULL, mailbox TEXT, action TEXT,
+        boxes TEXT NOT NULL DEFAULT '{}', created_at TEXT, done_at TEXT);
+        INSERT INTO rules(mailbox, name, move_to, learn, spam_header) VALUES('*', 'Спам', 'Junk', 1, 1);
+        INSERT INTO rules(mailbox, name, move_to) VALUES('a@b.ru', 'ПУЯНГ', 'ПУЯНГ');""")
+    db.commit()
+    db.close()
+    s = Store(str(path))
+    assert s.learn_rule()["name"] == "Спам"
+    assert [r["name"] for r in s.learn_rules("a@b.ru")] == ["Спам"]
+    s.open_report("x@y.ru", "a@b.ru", "added")
+    assert s.one("SELECT rule_id FROM reports")["rule_id"] == s.learn_rule()["id"]

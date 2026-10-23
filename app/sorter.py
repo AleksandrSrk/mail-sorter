@@ -65,14 +65,16 @@ class MailboxSorter:
         self.learn: LearnSpam | None = None
         self.skip = set(DEFAULT_SKIP_FOLDERS)
         self.moved_by_sender = Counter()  # сколько писем каждого отправителя перенесено за проход
+        self.learn_folders: dict[str, int] = {}
 
     def reload_rules(self):
         """Правила читаются из базы перед каждым проходом — правки из бота применяются через минуту."""
         self.rules = self.store.rules_for(self.login)
         lr = self.store.learn_rule()
         self.learn = LearnSpam(folder=lr["move_to"], never_domains=self.own_domains) if lr else None
-        self.skip = set(DEFAULT_SKIP_FOLDERS) | {r.move_to for r in self.rules} | \
-            ({self.learn.folder} if self.learn else set())
+        # обучаемые папки: спам, БАНК, ДИСЛОКАЦИЯ, ... -> id правила
+        self.learn_folders = {r["move_to"]: r["id"] for r in self.store.learn_rules(self.login)}
+        self.skip = set(DEFAULT_SKIP_FOLDERS) | {r.move_to for r in self.rules} | set(self.learn_folders)
 
     # ---------- IMAP helpers ----------
     def _connect(self):
@@ -177,7 +179,7 @@ class MailboxSorter:
 
     def pick_rule(self, h: Hdr):
         for rule in self.rules:
-            if rule.learn and self.learn and not self.learn.allowed(h.sender):
+            if rule.unsubscribe and self.learn and not self.learn.allowed(h.sender):
                 continue  # свои домены никогда не спам
             if rule.matches(h.sender, h.subject, h.flag):
                 return rule
@@ -185,29 +187,29 @@ class MailboxSorter:
 
     # ---------- learning ----------
     def _learn(self, m, folders):
-        """Новые письма в папке спама положил туда пользователь — учимся (и ставим отписку в очередь)."""
-        if not self.learn:
-            return []
-        raw = folders.get(self.learn.folder)
-        if not raw:
-            return []
-        res = self._new_uids(m, raw, full=False)
-        if res is None:
-            return []
-        uids, uidvalidity, max_uid = res
+        """Новые письма в обучаемых папках (спам, БАНК, ...) положил туда пользователь — учимся.
+        Свои домены не учатся никогда (их можно добавить в правило вручную)."""
         events = []
-        if uids:
-            for h in self._fetch_headers(m, uids).values():
-                if self.learn.allowed(h.sender):
-                    action = self.store.learn(h.sender, self.login, h.lu, h.lup)
-                    if action:
-                        events.append((h.sender, action))
-                        self.store.open_report(h.sender, self.login, action)
-            for sender, action in events:
-                log.info("[%s] спам-фильтр: %s %s", self.login,
-                         "добавлен" if action == "added" else "возвращён", sender)
-        m.close()
-        self.state[raw] = [uidvalidity, max_uid]
+        own = LearnSpam(never_domains=self.own_domains)
+        for folder, rule_id in self.learn_folders.items():
+            raw = folders.get(folder)
+            if not raw:
+                continue
+            res = self._new_uids(m, raw, full=False)
+            if res is None:
+                continue
+            uids, uidvalidity, max_uid = res
+            if uids:
+                for h in self._fetch_headers(m, uids).values():
+                    if own.allowed(h.sender):
+                        action = self.store.learn(h.sender, self.login, h.lu, h.lup, rule_id=rule_id)
+                        if action:
+                            events.append((h.sender, action))
+                            self.store.open_report(h.sender, self.login, action, rule_id=rule_id)
+                            log.info("[%s] %s: %s %s", self.login, folder,
+                                     "добавлен" if action == "added" else "возвращён", h.sender)
+            m.close()
+            self.state[raw] = [uidvalidity, max_uid]
         return events
 
     def _collect_sent(self, m, folders):
@@ -226,13 +228,16 @@ class MailboxSorter:
         self.state[key] = [uidvalidity, max_uid]
         return len(found)
 
-    def _skip_own_moves(self, m, folders):
-        """Письма, которые мы сами перенесли в папку спама, не должны попасть в обучение."""
-        raw = folders.get(self.learn.folder)
-        typ, st = m.status(_quote(raw), "(UIDNEXT UIDVALIDITY)")
-        uidnext, uidvalidity = parse_status(st[0] if typ == "OK" and st else b"")
-        if uidnext is not None:
-            self.state[raw] = [uidvalidity, uidnext - 1]
+    def _skip_own_moves(self, m, folders, moved_into):
+        """Письма, которые мы сами перенесли в обучаемые папки, не должны попасть в обучение."""
+        for folder in moved_into:
+            raw = folders.get(folder)
+            if not raw:
+                continue
+            typ, st = m.status(_quote(raw), "(UIDNEXT UIDVALIDITY)")
+            uidnext, uidvalidity = parse_status(st[0] if typ == "OK" and st else b"")
+            if uidnext is not None:
+                self.state[raw] = [uidvalidity, uidnext - 1]
 
     # ---------- догоняющий поиск по новым адресам ----------
     SWEPT_KEY = "_swept"
@@ -247,10 +252,10 @@ class MailboxSorter:
                 out[f"{r.id}:d:{d}"] = "@" + d
         return out
 
-    def _sweep(self, m, folders, dest, needles) -> tuple[int, bool]:
+    def _sweep(self, m, folders, dest, needles) -> tuple[int, set]:
         """Старые письма от только что добавленных адресов/доменов — ищем на сервере и переносим,
         не дожидаясь ночного полного прохода. Решение всё равно принимает pick_rule по заголовкам."""
-        moved, to_learn = 0, False
+        moved, to_learn = 0, set()
         for name, raw in folders.items():
             if name in self.skip:
                 continue
@@ -273,7 +278,8 @@ class MailboxSorter:
                     self._move(m, uids, dest[rule.move_to], rule.mark_read)
                     self.moved_by_sender.update(sender for _, sender in items)
                     moved += len(uids)
-                    to_learn |= bool(self.learn and rule.move_to == self.learn.folder)
+                    if rule.move_to in self.learn_folders:
+                        to_learn.add(rule.move_to)
                     log.info("[%s] %s (новые адреса, старые письма): %s -> %s, писем %d",
                              self.login, rule.name, name, rule.move_to, len(uids))
             m.close()
@@ -284,10 +290,10 @@ class MailboxSorter:
         """Один проход. full=True — все письма во всех папках, иначе только новые.
         Возвращает (перенесено писем, события обучения [(адрес, 'added'|'returned')])."""
         self.reload_rules()
-        if not self.rules and not self.learn:
+        if not self.rules and not self.learn_folders:
             return 0, []
         moved_total = 0
-        moved_to_learn = False
+        moved_to_learn = set()
         self.moved_by_sender = Counter()
         m = self._connect()
         try:
@@ -317,8 +323,8 @@ class MailboxSorter:
                                 self.store.touch_seen(rule.id, sender)
                         moved_total += len(items)
                         self.moved_by_sender.update(sender for _, sender in items)
-                        if self.learn and rule.move_to == self.learn.folder:
-                            moved_to_learn = True
+                        if rule.move_to in self.learn_folders:
+                            moved_to_learn.add(rule.move_to)
                         log.info("[%s] %s: %s -> %s, писем %d", self.login, rule.name, name, rule.move_to, len(items))
                 m.close()
                 self.state[raw] = [uidvalidity, max_uid]
@@ -336,11 +342,9 @@ class MailboxSorter:
                     moved_to_learn |= to_learn
                     self.state[self.SWEPT_KEY] = sorted(swept | set(fresh))
             if moved_to_learn:
-                self._skip_own_moves(m, folders)
-            lr = next((r for r in self.rules if r.learn), None)
-            if lr:
-                self.store.report_progress(self.login, set(self.state.get(self.SWEPT_KEY, [])), lr.id,
-                                           self.moved_by_sender)
+                self._skip_own_moves(m, folders, moved_to_learn)
+            if self.learn_folders:
+                self.store.report_progress(self.login, set(self.state.get(self.SWEPT_KEY, [])), self.moved_by_sender)
         finally:
             try:
                 m.logout()

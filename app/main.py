@@ -62,15 +62,20 @@ def process_unsubs(store, settings, notifier, log):
 
 
 def format_report(r) -> str:
-    if r["action"] == "returned":
-        head = f"↩️ Снова в спам-фильтре: {r['sender']}"
+    spam = r.get("spam", True)
+    folder = r.get("folder", "Нежелательная почта")
+    if spam:
+        head = (f"↩️ Снова в спам-фильтре: {r['sender']}" if r["action"] == "returned"
+                else f"🚫 В спам-фильтр добавлен: {r['sender']}")
+        where, into = "Кинули в спам в ящике", "в спам"
     else:
-        head = f"🚫 В спам-фильтр добавлен: {r['sender']}"
-    lines = [head, f"Кинули в спам в ящике: {r['mailbox']}", ""]
+        head = f"📁 {folder}: {'снова ' if r['action'] == 'returned' else ''}добавлен {r['sender']}"
+        where, into = f"Положили в «{folder}» в ящике", f"в «{folder}»"
+    lines = [head, f"{where}: {r['mailbox']}", ""]
     moved = {mb: n for mb, n in r["boxes"].items() if n}
     total = sum(moved.values())
     if total:
-        lines.append(f"Старые письма перенесены в спам: {total}")
+        lines.append(f"Старые письма перенесены {into}: {total}")
         lines += [f"  • {mb} — {n}" for mb, n in sorted(moved.items(), key=lambda x: -x[1])]
         rest = len(r["boxes"]) - len(moved)
         if rest:
@@ -79,6 +84,8 @@ def format_report(r) -> str:
         lines.append(f"Других писем от него ни в одном из {len(r['boxes'])} ящиков не было.")
     if r["missing"]:
         lines.append("⚠️ Не проверены (ящик недоступен): " + ", ".join(r["missing"]))
+    if not spam:
+        return "\n".join(lines)
     lines.append("")
     if r["no_unsub"]:
         lines.append("Отписка: не делаем — от него уже отписывались, теперь он в фильтре навсегда.")

@@ -72,3 +72,12 @@ def test_report_text_variants():
     assert "ни в одном из 2 ящиков" in t and "нет заголовка" in t
     t = main.format_report(dict(base, action="returned", unsubs=[], no_unsub=True, missing=["c@our.ru"]))
     assert t.startswith("↩️") and "навсегда" in t and "c@our.ru" in t
+
+
+
+def test_report_text_folder():
+    r = {"sender": "robot@bank.ru", "mailbox": "b@our.ru", "boxes": {"a@our.ru": 2, "b@our.ru": 0},
+         "missing": [], "action": "added", "unsubs": [], "no_unsub": False, "folder": "БАНК", "spam": False}
+    t = main.format_report(r)
+    assert t.startswith("📁 БАНК: добавлен robot@bank.ru") and "Положили в «БАНК» в ящике: b@our.ru" in t
+    assert "перенесены в «БАНК»: 2" in t and "Отписка" not in t

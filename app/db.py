@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS rules(
     mark_read INTEGER NOT NULL DEFAULT 0,
     spam_header INTEGER NOT NULL DEFAULT 0,
     learn INTEGER NOT NULL DEFAULT 0,   -- сюда пишет обучение (папка = move_to)
+    unsubscribe INTEGER NOT NULL DEFAULT 0,  -- отписка от рассылок (только спам)
     position INTEGER NOT NULL DEFAULT 100,
     enabled INTEGER NOT NULL DEFAULT 1,
     UNIQUE(mailbox, name)
@@ -62,7 +63,8 @@ CREATE TABLE IF NOT EXISTS contacts(
 CREATE TABLE IF NOT EXISTS reports(
     id INTEGER PRIMARY KEY,
     sender TEXT NOT NULL,
-    mailbox TEXT,                 -- где кинули в спам
+    rule_id INTEGER,              -- в какое правило выучен
+    mailbox TEXT,                 -- где кинули в папку
     action TEXT,                  -- added / returned
     boxes TEXT NOT NULL DEFAULT '{}',  -- {ящик: сколько старых писем перенесено}
     created_at TEXT, done_at TEXT
@@ -87,6 +89,15 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=30000")
         self.db.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self):
+        cols = {r["name"] for r in self.q("PRAGMA table_info(rules)")}
+        if "unsubscribe" not in cols:   # до появления обучаемых папок обучаемым было только правило спама
+            self.x("ALTER TABLE rules ADD COLUMN unsubscribe INTEGER NOT NULL DEFAULT 0")
+            self.x("UPDATE rules SET unsubscribe=1 WHERE learn=1")
+        if "rule_id" not in {r["name"] for r in self.q("PRAGMA table_info(reports)")}:
+            self.x("ALTER TABLE reports ADD COLUMN rule_id INTEGER")
 
     def q(self, sql, *args):
         return self.db.execute(sql, args).fetchall()
@@ -107,9 +118,11 @@ class Store:
                key, str(value))
 
     # ---------- rules & entries ----------
-    def add_rule(self, mailbox, name, move_to, mark_read=False, spam_header=False, learn=False, position=100) -> int:
-        self.x("INSERT OR IGNORE INTO rules(mailbox, name, move_to, mark_read, spam_header, learn, position) "
-               "VALUES(?,?,?,?,?,?,?)", mailbox, name, move_to, int(mark_read), int(spam_header), int(learn), position)
+    def add_rule(self, mailbox, name, move_to, mark_read=False, spam_header=False, learn=False, position=100,
+                 unsubscribe=False) -> int:
+        self.x("INSERT OR IGNORE INTO rules(mailbox, name, move_to, mark_read, spam_header, learn, position, "
+               "unsubscribe) VALUES(?,?,?,?,?,?,?,?)", mailbox, name, move_to, int(mark_read), int(spam_header),
+               int(learn), position, int(unsubscribe))
         return self.one("SELECT id FROM rules WHERE mailbox=? AND name=?", mailbox, name)["id"]
 
     def add_entry(self, rule_id, kind, value, source="manual", status="active") -> int:
@@ -121,11 +134,12 @@ class Store:
 
     def rules_for(self, mailbox) -> list[Rule]:
         rows = self.q("SELECT * FROM rules WHERE enabled=1 AND mailbox IN ('*', ?) "
-                      "ORDER BY mailbox != '*', position, id", mailbox)
+                      "ORDER BY position, mailbox != '*', id", mailbox)
         out = []
         for r in rows:
             rule = Rule(name=r["name"], move_to=r["move_to"], spam_header=bool(r["spam_header"]),
-                        learn=bool(r["learn"]), mark_read=bool(r["mark_read"]), id=r["id"])
+                        learn=bool(r["learn"]), mark_read=bool(r["mark_read"]), id=r["id"],
+                        unsubscribe=bool(r["unsubscribe"]))
             for e in self.q("SELECT kind, value, status FROM entries WHERE rule_id=?", r["id"]):
                 active = e["status"] in IN_FILTER
                 if e["kind"] == "addr":
@@ -138,7 +152,13 @@ class Store:
         return out
 
     def learn_rule(self):
-        return self.one("SELECT * FROM rules WHERE enabled=1 AND learn=1 ORDER BY id LIMIT 1")
+        """Правило спама: обучаемое + с отпиской."""
+        return self.one("SELECT * FROM rules WHERE enabled=1 AND learn=1 AND unsubscribe=1 ORDER BY id LIMIT 1")
+
+    def learn_rules(self, mailbox):
+        """Все обучаемые правила ящика (спам, БАНК, ДИСЛОКАЦИЯ, ...): папка = move_to."""
+        return self.q("SELECT * FROM rules WHERE enabled=1 AND learn=1 AND mailbox IN ('*', ?) "
+                      "ORDER BY position, mailbox != '*', id", mailbox)
 
     def touch_seen(self, rule_id, sender, now=None):
         """Письмо от sender попало под правило — обновляем «последний раз видели» (для недели тишины)."""
@@ -147,19 +167,24 @@ class Store:
                "((kind='addr' AND value=?) OR (kind='domain' AND value=?))", ts, rule_id, sender, domain_of(sender))
 
     # ---------- learning & unsubscribe ----------
-    def learn(self, sender, mailbox, list_unsub="", list_unsub_post="", now=None):
-        """Пользователь сам кинул письмо от sender в папку спама. Возвращает 'added' / 'returned' / None."""
-        rule = self.learn_rule()
+    def learn(self, sender, mailbox, list_unsub="", list_unsub_post="", now=None, rule_id=None):
+        """Пользователь сам положил письмо от sender в обучаемую папку (по умолчанию — спам).
+        Возвращает 'added' / 'returned' / None."""
+        rule = self.one("SELECT * FROM rules WHERE id=?", rule_id) if rule_id else self.learn_rule()
         if not rule or not sender:
             return None
         ts = now_iso(now)
+        # последнее слово за пользователем: из других обучаемых папок адрес снимаем
+        self.x("UPDATE entries SET status='removed', updated_at=? WHERE kind='addr' AND value=? AND rule_id!=? AND "
+               "status IN ('active','unsubscribing') AND rule_id IN (SELECT id FROM rules WHERE learn=1)",
+               ts, sender, rule["id"])
         e = self.one("SELECT * FROM entries WHERE rule_id=? AND kind='addr' AND value=?", rule["id"], sender)
         action = None
         if e is None:
             dom = self.one("SELECT 1 FROM entries WHERE rule_id=? AND kind='domain' AND value=? AND status IN "
                            "('active','unsubscribing')", rule["id"], domain_of(sender))
             if dom:
-                return None  # домен целиком уже в фильтре
+                return None  # домен целиком уже в правиле
             self.x("INSERT INTO entries(rule_id, kind, value, source, status, created_at, updated_at) "
                    "VALUES(?, 'addr', ?, 'learned', 'active', ?, ?)", rule["id"], sender, ts, ts)
             action = "added"
@@ -168,6 +193,8 @@ class Store:
             self.x("UPDATE entries SET status='active', no_unsub=?, hidden=0, updated_at=? WHERE id=?",
                    no_unsub, ts, e["id"])
             action = "returned"
+        if not rule["unsubscribe"]:
+            return action
         e = self.one("SELECT * FROM entries WHERE rule_id=? AND kind='addr' AND value=?", rule["id"], sender)
         # подписка у каждого ящика своя — отписываем каждый ящик один раз
         if list_unsub and not e["no_unsub"] and e["status"] != "unsubscribed" and \
@@ -202,31 +229,38 @@ class Store:
         return [r["value"] for r in rows]
 
     # ---------- отчёты о новых адресах в спам-фильтре ----------
-    def open_report(self, sender, mailbox, action, now=None):
-        if not self.one("SELECT 1 FROM reports WHERE sender=? AND done_at IS NULL", sender):
-            self.x("INSERT INTO reports(sender, mailbox, action, created_at) VALUES(?,?,?,?)",
-                   sender, mailbox, action, now_iso(now))
+    def open_report(self, sender, mailbox, action, rule_id=None, now=None):
+        if rule_id is None:
+            lr = self.learn_rule()
+            rule_id = lr["id"] if lr else None
+        if not self.one("SELECT 1 FROM reports WHERE sender=? AND rule_id IS ? AND done_at IS NULL", sender, rule_id):
+            self.x("INSERT INTO reports(sender, rule_id, mailbox, action, created_at) VALUES(?,?,?,?,?)",
+                   sender, rule_id, mailbox, action, now_iso(now))
 
     def has_open_report(self, sender) -> bool:
         return bool(self.one("SELECT 1 FROM reports WHERE sender=? AND done_at IS NULL", sender))
 
-    def report_progress(self, mailbox, swept_keys, rule_id, moved_by_sender):
+    def report_progress(self, mailbox, swept_keys, moved_by_sender):
         """Ящик прочесал старую почту по адресу — записываем, сколько писем перенёс."""
-        for r in self.q("SELECT id, sender, boxes FROM reports WHERE done_at IS NULL"):
+        spam = self.learn_rule()
+        for r in self.q("SELECT id, sender, boxes, rule_id FROM reports WHERE done_at IS NULL"):
+            rid = r["rule_id"] or (spam["id"] if spam else None)
             boxes = json.loads(r["boxes"])
-            if mailbox not in boxes and f"{rule_id}:a:{r['sender']}" in swept_keys:
+            if mailbox not in boxes and f"{rid}:a:{r['sender']}" in swept_keys:
                 boxes[mailbox] = moved_by_sender.get(r["sender"], 0)
                 self.x("UPDATE reports SET boxes=? WHERE id=?", json.dumps(boxes, ensure_ascii=False), r["id"])
 
     def ready_reports(self, mailboxes, timeout_min=30, now=None):
         """Отчёты, по которым отметились все ящики (или вышел таймаут) и отписка уже отработала."""
         now = now or datetime.now(timezone.utc)
+        spam = self.learn_rule()
         out = []
         for r in self.q("SELECT * FROM reports WHERE done_at IS NULL ORDER BY id"):
             boxes = json.loads(r["boxes"])
             timed_out = r["created_at"] < now_iso(now - timedelta(minutes=timeout_min))
-            entry = self.one("SELECT e.id, e.no_unsub FROM entries e JOIN rules ru ON ru.id=e.rule_id "
-                             "WHERE ru.learn=1 AND e.kind='addr' AND e.value=?", r["sender"])
+            rule = self.one("SELECT * FROM rules WHERE id=?", r["rule_id"] or (spam["id"] if spam else 0))
+            entry = self.one("SELECT id, no_unsub FROM entries WHERE rule_id=? AND kind='addr' AND value=?",
+                             rule["id"] if rule else 0, r["sender"])
             unsubs = self.q("SELECT mailbox, status, result FROM unsubs WHERE entry_id=? ORDER BY id",
                             entry["id"]) if entry else []
             if any(u["status"] == "pending" for u in unsubs) and not timed_out:
@@ -234,7 +268,9 @@ class Store:
             if set(mailboxes) <= set(boxes) or timed_out:
                 out.append({"id": r["id"], "sender": r["sender"], "mailbox": r["mailbox"], "action": r["action"],
                             "boxes": boxes, "missing": sorted(set(mailboxes) - set(boxes)),
-                            "unsubs": [dict(u) for u in unsubs], "no_unsub": bool(entry and entry["no_unsub"])})
+                            "unsubs": [dict(u) for u in unsubs], "no_unsub": bool(entry and entry["no_unsub"]),
+                            "folder": rule["move_to"] if rule else "?",
+                            "spam": bool(rule and rule["unsubscribe"])})
         return out
 
     def close_report(self, report_id, now=None):
@@ -272,7 +308,7 @@ class Store:
             mb = "*" if mailbox == "_all" else _norm_addr(mailbox)
             for pos, rule in enumerate(_parse_rules(conf.get("rules"), mailbox)):
                 rid = self.add_rule(mb, rule.name, rule.move_to, rule.mark_read, rule.spam_header, rule.learn,
-                                    position=(pos + 1) * 10)
+                                    position=(pos + 1) * 10, unsubscribe=rule.learn and rule.spam_header)
                 if rule.learn and learn_id is None:
                     learn_id = rid
                 for a in rule.senders:

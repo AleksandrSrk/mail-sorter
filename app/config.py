@@ -26,6 +26,7 @@ class Rule:
     spam_header: bool = False   # срабатывать на серверную метку спама (X-Spam-Flag / X-Spam-Status: yes)
     learn: bool = False         # в это правило пишет обучение (папка спама = move_to)
     mark_read: bool = False
+    unsubscribe: bool = False   # отписываться от рассылок, брошенных пользователем в эту папку (спам)
     id: int = 0
     exempt_senders: set = field(default_factory=set)  # сняты с правила вручную / отписаны — не трогаем
     exempt_domains: set = field(default_factory=set)
