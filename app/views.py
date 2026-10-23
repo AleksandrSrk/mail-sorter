@@ -2,6 +2,7 @@
 
 Экран = (текст, ряды кнопок [[(подпись, callback_data), ...], ...]).
 callback_data: "<список>:<действие>:<id>:<страница>"  (лимит Telegram — 64 байта)."""
+import re
 from math import ceil
 
 from .db import IN_FILTER, Store, now_iso
@@ -215,3 +216,77 @@ def act(store, data: str):
     else:
         return None, ""
     return SCREENS[screen](store, page), note
+
+
+# ---------- поиск и ручное снятие адреса ----------
+ADDR_RE = re.compile(r"[\w.+'-]+@[\w-]+(?:\.[\w-]+)+")
+STATUS_FULL = {
+    "active": "🔴 в фильтре",
+    "unsubscribing": "📭 в фильтре, отписались — ждём неделю тишины",
+    "unsubscribed": "🔕 отписаны, сняты с фильтра",
+    "removed": "⚪ снят с фильтра",
+}
+
+
+def parse_addresses(text: str) -> list[str]:
+    seen = []
+    for a in ADDR_RE.findall(text or ""):
+        a = a.lower().strip(".")
+        if a not in seen:
+            seen.append(a)
+    return seen
+
+
+def check_address(store, addr: str, own_domains=()) -> str:
+    dom = addr.rsplit("@", 1)[1]
+    lines = [f"🔎 {addr}"]
+    if dom in own_domains:
+        lines.append("Свой домен — спамом не считается и автоматически не учится.")
+    rows = store.q("SELECT e.*, r.name AS rule, r.mailbox AS rmb, r.unsubscribe AS is_spam FROM entries e "
+                   "JOIN rules r ON r.id=e.rule_id WHERE (e.kind='addr' AND e.value=?) OR (e.kind='domain' AND e.value=?) "
+                   "ORDER BY r.position, r.id", addr, dom)
+    if not rows:
+        lines.append("Ни в одном списке нет.")
+    for e in rows:
+        where = f"«{e['rule']}»" + ("" if e["rmb"] == "*" else f" (только {e['rmb']})")
+        what = "адрес" if e["kind"] == "addr" else f"весь домен @{e['value']}"
+        st = STATUS_FULL.get(e["status"], e["status"])
+        extra = [f"источник: {e['source']}", f"с {(e['created_at'] or '')[:10]}"]
+        if e["hidden"]:
+            extra.append("скрыт в боте")
+        if e["no_unsub"]:
+            extra.append("больше не отписываемся")
+        if e["last_seen_at"]:
+            extra.append(f"последнее письмо {e['last_seen_at'][:10]}")
+        lines.append(f"• {where}: {what} — {st}\n   " + ", ".join(extra))
+        if e["kind"] == "addr" and e["is_spam"]:
+            for u in store.q("SELECT mailbox, status, result FROM unsubs WHERE entry_id=? ORDER BY id", e["id"]):
+                mark = {"done": "✅", "failed": "❌"}.get(u["status"], "⏳")
+                lines.append(f"   отписка {mark} {u['mailbox']}: {u['result'] or 'в очереди'}")
+    sent = store.one("SELECT sent FROM contacts WHERE address=?", addr)
+    lines.append(f"Мы ему писали: {sent['sent']} раз." if sent else "Мы ему не писали.")
+    return "\n".join(lines)
+
+
+def remove_from_spam(store, addr: str) -> str:
+    rid = _learn_id(store)
+    if rid is None:
+        return f"{addr}: спам-фильтр не настроен."
+    ts = now_iso()
+    dom = addr.rsplit("@", 1)[1]
+    e = store.one("SELECT * FROM entries WHERE rule_id=? AND kind='addr' AND value=?", rid, addr)
+    by_domain = store.one(f"SELECT 1 FROM entries WHERE rule_id=? AND kind='domain' AND value=? "
+                          f"AND status IN ({','.join('?' * len(IN_FILTER))})", rid, dom, *IN_FILTER)
+    if e and e["status"] in IN_FILTER:
+        store.x("UPDATE entries SET status='removed', hidden=0, updated_at=? WHERE id=?", ts, e["id"])
+        msg = f"✅ {addr} убран из спам-фильтра."
+    elif by_domain and not e:
+        store.add_entry(rid, "addr", addr, "bot", status="removed")
+        msg = f"✅ {addr}: адреса в списке не было, но весь домен @{dom} в спаме — добавил исключение для этого адреса."
+    elif e:
+        return f"ℹ️ {addr} в спам-фильтре уже нет ({STATUS_FULL.get(e['status'], e['status'])})."
+    else:
+        return f"ℹ️ {addr} в спам-фильтре не было."
+    if by_domain and e:
+        msg += f" Домен @{dom} целиком остаётся в спаме, этот адрес теперь исключение."
+    return msg + " Письма, которые уже лежат в «Нежелательной почте», переложи вручную."

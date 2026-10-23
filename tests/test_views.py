@@ -65,3 +65,38 @@ def test_paging_and_garbage(store):
     assert "3/3" in [t for row in rows for t, _ in row]
     assert views.act(store, "мусор") == (None, "")
     assert all(len(d.encode()) <= 64 for row in rows for _, d in row)
+
+
+def test_parse_addresses():
+    assert views.parse_addresses("Bad@Spam.ru, x@y.ru\nbad@spam.ru и мусор.") == ["bad@spam.ru", "x@y.ru"]
+    assert views.parse_addresses("тут нет адреса") == []
+
+
+def test_check_address_everywhere(store):
+    bank = store.add_rule("*", "БАНК", "БАНК", learn=True, position=50)
+    store.add_entry(bank, "addr", "robot@bank.ru", "seed")
+    store.learn("n@x.ru", "box@our.ru", "<mailto:u@x.ru>")
+    store.finish_unsub(store.pending_unsubs()[0]["id"], True, "письмо на u@x.ru")
+    t = views.check_address(store, "n@x.ru")
+    assert "«Спам»: адрес — 📭 в фильтре, отписались" in t and "отписка ✅ box@our.ru: письмо на u@x.ru" in t
+    t = views.check_address(store, "robot@bank.ru")
+    assert "«БАНК»: адрес — 🔴 в фильтре" in t and "Мы ему не писали." in t
+    t = views.check_address(store, "p@mail.ru")
+    assert "«Партнёр» (только box@our.ru)" in t
+    t = views.check_address(store, "any@junk.example")
+    assert "весь домен @junk.example" in t
+    store.add_contacts(["nobody@corp.ru"])
+    t = views.check_address(store, "nobody@corp.ru", own_domains={"our.ru"})
+    assert "Ни в одном списке нет." in t and "писали: 1 раз" in t
+    assert "Свой домен" in views.check_address(store, "boss@our.ru", own_domains={"our.ru"})
+
+
+def test_remove_from_spam(store):
+    assert views.remove_from_spam(store, "bad@spam.ru").startswith("✅ bad@spam.ru убран")
+    assert not store.rules_for("box@our.ru")[0].matches("bad@spam.ru", "", spam_flag=True)
+    assert "уже нет" in views.remove_from_spam(store, "bad@spam.ru")
+    assert "не было" in views.remove_from_spam(store, "never@x.ru")
+    t = views.remove_from_spam(store, "good@junk.example")               # под доменом — исключение
+    assert "исключение" in t
+    spam = store.rules_for("box@our.ru")[0]
+    assert not spam.matches("good@junk.example", "") and spam.matches("other@junk.example", "")

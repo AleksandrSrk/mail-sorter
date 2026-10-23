@@ -17,8 +17,12 @@ from .db import Store
 
 log = logging.getLogger("bot")
 BUTTONS = {"📧 Спам-адреса": "a", "🌐 Спам-домены": "d", "🙈 Скрытые": "h", "📭 Отписанные": "u"}
+ASK = {"🔎 Проверить адрес": "check", "✅ Убрать из спама": "remove"}
+PROMPT = {"check": "Пришли адрес (можно несколько) — покажу, в каких списках он есть.",
+          "remove": "Пришли адрес (можно несколько), который убрать из спам-фильтра."}
 MENU = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text=t) for t in list(BUTTONS)[:2]], [KeyboardButton(text=t) for t in list(BUTTONS)[2:]]],
+    keyboard=[[KeyboardButton(text=t) for t in list(BUTTONS)[:2]], [KeyboardButton(text=t) for t in list(BUTTONS)[2:]],
+              [KeyboardButton(text=t) for t in ASK]],
     resize_keyboard=True, is_persistent=True)
 
 
@@ -29,8 +33,9 @@ def markup(rows):
                                                  for row in rows])
 
 
-def build_router(store: Store, admin_id: int) -> Router:
+def build_router(store: Store, admin_id: int, own_domains=()) -> Router:
     r = Router()
+    waiting = {}  # chat_id -> "check" | "remove": ждём адрес после нажатия кнопки
     r.message.filter(F.from_user.id == admin_id)          # все остальные — тишина
     r.callback_query.filter(F.from_user.id == admin_id)
 
@@ -43,6 +48,25 @@ def build_router(store: Store, admin_id: int) -> Router:
     async def show(m: Message):
         text, rows = views.SCREENS[BUTTONS[m.text]](store, 0)
         await m.answer(text, reply_markup=markup(rows))
+
+    @r.message(F.text.in_(ASK))
+    async def ask(m: Message):
+        waiting[m.chat.id] = ASK[m.text]
+        await m.answer(PROMPT[ASK[m.text]])
+
+    @r.message(F.text)
+    async def addresses_input(m: Message):
+        mode = waiting.pop(m.chat.id, None)
+        addrs = views.parse_addresses(m.text)
+        if not addrs:
+            await m.answer("Не вижу адреса почты. Нажми кнопку ещё раз и пришли адрес вида name@domain.ru.")
+            return
+        if mode == "remove":
+            text = "\n\n".join(views.remove_from_spam(store, a) for a in addrs)
+        else:  # кнопка «проверить» или просто прислали адрес
+            text = "\n\n".join(views.check_address(store, a, own_domains) for a in addrs)
+        for i in range(0, len(text), 4000):
+            await m.answer(text[i:i + 4000], reply_markup=MENU)
 
     @r.callback_query(F.data == "noop")
     async def noop(c: CallbackQuery):
@@ -79,7 +103,7 @@ async def run():
     store = Store(s.db_path)
     bot = Bot(s.tg_token)
     dp = Dispatcher()
-    dp.include_router(build_router(store, s.tg_admin))
+    dp.include_router(build_router(store, s.tg_admin, s.own_domains))
     asyncio.create_task(heartbeat(os.path.join(s.data_dir, "bot_heartbeat")))
     log.info("бот запущен")
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
