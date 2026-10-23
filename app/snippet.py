@@ -72,7 +72,8 @@ def _llm(system: str, user: str):
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
     try:
         req = urllib.request.Request(url, data=json.dumps(body).encode(), method="POST",
-                                     headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
+                                     headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json",
+                                              "User-Agent": "mail-sorter/1.0"})  # Cloudflare режет Python-urllib
         with urllib.request.urlopen(req, timeout=40) as r:
             return json.load(r)["choices"][0]["message"]["content"].strip()[:800] or None
     except Exception as e:
