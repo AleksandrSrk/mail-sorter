@@ -17,9 +17,9 @@ from .db import Store
 
 log = logging.getLogger("bot")
 BUTTONS = {"📧 Спам-адреса": "a", "🌐 Спам-домены": "d", "🙈 Скрытые": "h", "📭 Отписанные": "u"}
-ASK = {"🔎 Проверить адрес": "check", "✅ Убрать из спама": "remove"}
-PROMPT = {"check": "Пришли адрес (можно несколько) — покажу, в каких списках он есть.",
-          "remove": "Пришли адрес (можно несколько), который убрать из спам-фильтра."}
+ASK = {"🔎 Проверить адрес": "check"}
+PROMPT = {"check": "Пришли адрес (можно несколько, можно прямо строкой из письма вроде «ООО Ромашка <info@x.ru>») — "
+                   "покажу, в каких списках он есть, и дам кнопки убрать."}
 MENU = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text=t) for t in list(BUTTONS)[:2]], [KeyboardButton(text=t) for t in list(BUTTONS)[2:]],
               [KeyboardButton(text=t) for t in ASK]],
@@ -35,7 +35,7 @@ def markup(rows):
 
 def build_router(store: Store, admin_id: int, own_domains=()) -> Router:
     r = Router()
-    waiting = {}  # chat_id -> "check" | "remove": ждём адрес после нажатия кнопки
+    waiting = {}  # chat_id -> "check": ждём адрес после нажатия кнопки
     r.message.filter(F.from_user.id == admin_id)          # все остальные — тишина
     r.callback_query.filter(F.from_user.id == admin_id)
 
@@ -61,23 +61,22 @@ def build_router(store: Store, admin_id: int, own_domains=()) -> Router:
         if not addrs:
             await m.answer("Не вижу адреса почты. Нажми кнопку ещё раз и пришли адрес вида name@domain.ru.")
             return
-        if mode == "remove":
-            text = "\n\n".join(views.remove_from_spam(store, a) for a in addrs)
-            for i in range(0, len(text), 4000):
-                await m.answer(text[i:i + 4000], reply_markup=MENU)
-            return
         for a in addrs:  # кнопка «проверить» или просто прислали адрес — по сообщению на адрес, с кнопками
             text, rows = views.check_screen(store, a, own_domains)
             await m.answer(text[:4000], reply_markup=markup(rows) or MENU)
 
-    @r.callback_query(F.data.startswith("x:rm:"))
+    @r.callback_query(F.data.startswith("x:rm:") | F.data.startswith("x:ex:"))
     async def restore(c: CallbackQuery):
         try:
-            entry_id = int(c.data.split(":")[2])
-        except (IndexError, ValueError):
+            _, kind, ident, tail = c.data.split(":", 3)
+            ident = int(ident)
+        except ValueError:
             await c.answer("Устаревшая кнопка")
             return
-        screen, note = views.restore(store, entry_id, own_domains)
+        if kind == "ex":
+            screen, note = views.exempt(store, ident, tail, own_domains)
+        else:
+            screen, note = views.restore(store, ident, own_domains)
         if screen:
             text, rows = screen
             try:

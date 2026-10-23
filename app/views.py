@@ -271,11 +271,26 @@ def check_screen(store, addr: str, own_domains=()):
     sent = store.one("SELECT sent FROM contacts WHERE address=?", addr)
     lines.append(f"Мы ему писали: {sent['sent']} раз." if sent else "Мы ему не писали.")
     buttons = []
+    own_addr_rules = {e["rule_id"] for e in rows if e["kind"] == "addr"}
     for e in rows:
-        if e["status"] in IN_FILTER:
-            what = "" if e["kind"] == "addr" else f"домен @{e['value']} "
-            buttons.append([(f"↩️ Убрать {what}из «{e['rule']}» → во входящие", f"x:rm:{e['id']}:0")])
+        if e["status"] not in IN_FILTER:
+            continue
+        if e["kind"] == "addr":
+            buttons.append([(f"↩️ Убрать из «{e['rule']}» → во входящие", f"x:rm:{e['id']}:0")])
+            continue
+        buttons.append([(f"↩️ Убрать весь домен @{e['value']} из «{e['rule']}»", f"x:rm:{e['id']}:0")])
+        data = f"x:ex:{e['rule_id']}:{addr}"
+        if e["rule_id"] not in own_addr_rules and len(data.encode()) <= 64:
+            buttons.append([(f"↩️ Только {addr} — исключение, во входящие", data)])
     return "\n".join(lines), buttons
+
+
+def exempt(store, rule_id: int, addr: str, own_domains=()):
+    """Адрес под доменом, заблокированным целиком: исключение только для него + возврат его писем."""
+    if not store.one("SELECT 1 FROM rules WHERE id=?", rule_id) or not ADDR_RE.fullmatch(addr):
+        return None, "Устаревшая кнопка"
+    eid = store.add_entry(rule_id, "addr", addr, "bot")
+    return restore(store, eid, own_domains)
 
 
 def restore(store, entry_id: int, own_domains=()):
@@ -289,27 +304,3 @@ def restore(store, entry_id: int, own_domains=()):
         text, rows = check_screen(store, addr, own_domains)
         return (text + "\n\n" + note, rows), "Готово"
     return (f"Домен @{e['value']}: {note}", []), "Готово"
-
-
-def remove_from_spam(store, addr: str) -> str:
-    rid = _learn_id(store)
-    if rid is None:
-        return f"{addr}: спам-фильтр не настроен."
-    ts = now_iso()
-    dom = addr.rsplit("@", 1)[1]
-    e = store.one("SELECT * FROM entries WHERE rule_id=? AND kind='addr' AND value=?", rid, addr)
-    by_domain = store.one(f"SELECT 1 FROM entries WHERE rule_id=? AND kind='domain' AND value=? "
-                          f"AND status IN ({','.join('?' * len(IN_FILTER))})", rid, dom, *IN_FILTER)
-    if e and e["status"] in IN_FILTER:
-        store.x("UPDATE entries SET status='removed', hidden=0, updated_at=? WHERE id=?", ts, e["id"])
-        msg = f"✅ {addr} убран из спам-фильтра."
-    elif by_domain and not e:
-        store.add_entry(rid, "addr", addr, "bot", status="removed")
-        msg = f"✅ {addr}: адреса в списке не было, но весь домен @{dom} в спаме — добавил исключение для этого адреса."
-    elif e:
-        return f"ℹ️ {addr} в спам-фильтре уже нет ({STATUS_FULL.get(e['status'], e['status'])})."
-    else:
-        return f"ℹ️ {addr} в спам-фильтре не было."
-    if by_domain and e:
-        msg += f" Домен @{dom} целиком остаётся в спаме, этот адрес теперь исключение."
-    return msg + " Письма, которые уже лежат в «Нежелательной почте», переложи вручную."

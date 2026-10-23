@@ -72,6 +72,20 @@ def test_parse_addresses():
     assert views.parse_addresses("тут нет адреса") == []
 
 
+def test_parse_addresses_from_copied_text():
+    cases = {
+        "ООО «Ромашка» <info@romashka.example>": ["info@romashka.example"],
+        '"Фирма Качество" <info@quality.example>;': ["info@quality.example"],
+        "mailto:klass@etp.example.ru": ["klass@etp.example.ru"],
+        "e-mail: user.x2000@yandex.ru.": ["user.x2000@yandex.ru"],
+        "«first.last+tag@sub.mail.example.com»": ["first.last+tag@sub.mail.example.com"],
+        "(robot_1@wagon-track.example), [a-b@c.de]": ["robot_1@wagon-track.example", "a-b@c.de"],
+        "Кому: Иван <ivan@x.ru>, Пётр <petr@y.ru>": ["ivan@x.ru", "petr@y.ru"],
+    }
+    for text, want in cases.items():
+        assert views.parse_addresses(text) == want, text
+
+
 def test_check_address_everywhere(store):
     bank = store.add_rule("*", "БАНК", "БАНК", learn=True, position=50)
     store.add_entry(bank, "addr", "robot@bank.ru", "seed")
@@ -91,12 +105,15 @@ def test_check_address_everywhere(store):
     assert "Свой домен" in views.check_address(store, "boss@our.ru", own_domains={"our.ru"})
 
 
-def test_remove_from_spam(store):
-    assert views.remove_from_spam(store, "bad@spam.ru").startswith("✅ bad@spam.ru убран")
-    assert not store.rules_for("box@our.ru")[0].matches("bad@spam.ru", "", spam_flag=True)
-    assert "уже нет" in views.remove_from_spam(store, "bad@spam.ru")
-    assert "не было" in views.remove_from_spam(store, "never@x.ru")
-    t = views.remove_from_spam(store, "good@junk.example")               # под доменом — исключение
-    assert "исключение" in t
+def test_exempt_address_under_blocked_domain(store):
+    text, rows = views.check_screen(store, "good@junk.example")
+    datas = [d for row in rows for _, d in row]
+    assert any(d.startswith("x:rm:") for d in datas)                  # убрать весь домен
+    ex = next(d for d in datas if d.startswith("x:ex:"))
+    _, _, rid, addr = ex.split(":", 3)
+    (text, rows), note = views.exempt(store, int(rid), addr)
     spam = store.rules_for("box@our.ru")[0]
     assert not spam.matches("good@junk.example", "") and spam.matches("other@junk.example", "")
+    assert store.pending_restores("box@our.ru")[0]["needle"] == "good@junk.example"
+    assert not any(d.startswith("x:ex:") for row in rows for _, d in row)  # второй раз кнопки нет
+    assert views.exempt(store, int(rid), "мусор") == (None, "Устаревшая кнопка")
