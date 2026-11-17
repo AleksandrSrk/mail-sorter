@@ -13,7 +13,19 @@ def _norm_addr(a: str) -> str:
 
 
 def _norm_domain(d: str) -> str:
-    return (d or "").strip().lower().lstrip("@")
+    return (d or "").strip().lower().lstrip("@").rstrip(".")
+
+
+def domain_chain(domain: str) -> list[str]:
+    """'a.b.example.ru' -> ['a.b.example.ru', 'b.example.ru', 'example.ru'] (без голой зоны 'ru'):
+    запись «весь домен» действует и на поддомены."""
+    parts = _norm_domain(domain).split(".")
+    return [".".join(parts[i:]) for i in range(len(parts) - 1)] if len(parts) > 1 else ([parts[0]] if parts[0] else [])
+
+
+def domain_in(domain: str, domains) -> bool:
+    """Домен (или его родитель) есть в наборе доменов."""
+    return any(d in domains for d in domain_chain(domain))
 
 
 @dataclass
@@ -34,11 +46,11 @@ class Rule:
     def matches(self, sender: str, subject: str, spam_flag: bool = False) -> bool:
         sender = _norm_addr(sender)
         domain = sender.rsplit("@", 1)[1] if "@" in sender else ""
-        if sender and (sender in self.exempt_senders or domain in self.exempt_domains):
+        if sender and (sender in self.exempt_senders or domain_in(domain, self.exempt_domains)):
             return False
         if sender and sender in self.senders:
             return True
-        if domain and domain in self.sender_domains:
+        if domain and domain_in(domain, self.sender_domains):
             return True
         if self.spam_header and spam_flag:
             return True
@@ -59,7 +71,7 @@ class LearnSpam:
         sender = _norm_addr(sender)
         if not sender or "@" not in sender:
             return False
-        return sender.rsplit("@", 1)[1] not in self.never_domains
+        return not domain_in(sender.rsplit("@", 1)[1], self.never_domains)
 
 
 @dataclass

@@ -66,14 +66,18 @@ def process_unsubs(store, settings, notifier, log):
 def format_report(r) -> str:
     spam = r.get("spam", True)
     folder = r.get("folder", "Нежелательная почта")
+    manual = r.get("manual", False)            # добавлено кнопкой «В СПАМ» в боте, не жестом в ящике
+    is_domain = r.get("domain", False)
+    what = f"домен @{r['sender'][1:]} (и все поддомены)" if is_domain else r["sender"]
+    whose = "от этого домена" if is_domain else "от него"
     if spam:
-        head = (f"↩️ Снова в спам-фильтре: {r['sender']}" if r["action"] == "returned"
-                else f"🚫 В спам-фильтр добавлен: {r['sender']}")
+        head = (f"↩️ Снова в спам-фильтре: {what}" if r["action"] == "returned"
+                else f"🚫 В спам-фильтр добавлен: {what}")
         where, into = "Кинули в спам в ящике", "в спам"
     else:
-        head = f"📁 {folder}: {'снова ' if r['action'] == 'returned' else ''}добавлен {r['sender']}"
+        head = f"📁 {folder}: {'снова ' if r['action'] == 'returned' else ''}добавлен {what}"
         where, into = f"Положили в «{folder}» в ящике", f"в «{folder}»"
-    lines = [head, f"{where}: {r['mailbox']}", ""]
+    lines = [head, "Добавлено вручную из бота" if manual else f"{where}: {r['mailbox']}", ""]
     moved = {mb: n for mb, n in r["boxes"].items() if n}
     total = sum(moved.values())
     if total:
@@ -81,12 +85,15 @@ def format_report(r) -> str:
         lines += [f"  • {mb} — {n}" for mb, n in sorted(moved.items(), key=lambda x: -x[1])]
         rest = len(r["boxes"]) - len(moved)
         if rest:
-            lines.append(f"В остальных {rest} ящиках писем от него не было.")
+            lines.append(f"В остальных {rest} ящиках писем {whose} не было.")
     else:
-        lines.append(f"Других писем от него ни в одном из {len(r['boxes'])} ящиков не было.")
+        lines.append(f"Других писем {whose} ни в одном из {len(r['boxes'])} ящиков не было.")
     if r["missing"]:
         lines.append("⚠️ Не проверены (ящик недоступен): " + ", ".join(r["missing"]))
     if not spam:
+        return "\n".join(lines)
+    if manual:
+        lines += ["", "Отписку не делаю — добавлено вручную."]
         return "\n".join(lines)
     lines.append("")
     if r["no_unsub"]:

@@ -171,7 +171,7 @@ def test_new_address_sweeps_old_letters(store):
     moved, _ = s.run_once()
     assert moved == 2                                                # старые письма уехали без ночного прохода
     assert sorted(fake.f["INBOX"]["msgs"]) == [2] and fake.f["Archive"]["msgs"] == {}
-    assert {n for _, n in fake.searches} == {"old@veles.ru", "@newdom.ru"}
+    assert {n for _, n in fake.searches} == {"old@veles.ru", "newdom.ru"}   # домен ищем без «@» — так видны поддомены
     fake.searches.clear()
     assert s.run_once()[0] == 0 and fake.searches == []             # второй раз по тем же не ищем
 

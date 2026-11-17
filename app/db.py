@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 import yaml
 
-from .config import Rule, _as_list, _norm_addr, _norm_domain
+from .config import Rule, _as_list, _norm_addr, _norm_domain, domain_chain, domain_in
 
 IN_FILTER = ("active", "unsubscribing")
 EXEMPT = ("removed", "unsubscribed")
@@ -209,8 +209,10 @@ class Store:
     def touch_seen(self, rule_id, sender, now=None):
         """Письмо от sender попало под правило — обновляем «последний раз видели» (для недели тишины)."""
         ts = now_iso(now)
+        chain = domain_chain(domain_of(sender))
         self.x("UPDATE entries SET last_seen_at=? WHERE rule_id=? AND status IN ('active','unsubscribing') AND "
-               "((kind='addr' AND value=?) OR (kind='domain' AND value=?))", ts, rule_id, sender, domain_of(sender))
+               f"((kind='addr' AND value=?) OR (kind='domain' AND value IN ({','.join('?' * len(chain))})))",
+               ts, rule_id, sender, *chain)
 
     # ---------- learning & unsubscribe ----------
     def learn(self, sender, mailbox, list_unsub="", list_unsub_post="", now=None, rule_id=None):
@@ -227,8 +229,10 @@ class Store:
         e = self.one("SELECT * FROM entries WHERE rule_id=? AND kind='addr' AND value=?", rule["id"], sender)
         action = None
         if e is None:
-            dom = self.one("SELECT 1 FROM entries WHERE rule_id=? AND kind='domain' AND value=? AND status IN "
-                           "('active','unsubscribing')", rule["id"], domain_of(sender))
+            chain = domain_chain(domain_of(sender))
+            dom = self.one("SELECT 1 FROM entries WHERE rule_id=? AND kind='domain' AND status IN "
+                           f"('active','unsubscribing') AND value IN ({','.join('?' * len(chain))})",
+                           rule["id"], *chain)
             if dom:
                 return None  # домен целиком уже в правиле
             self.x("INSERT INTO entries(rule_id, kind, value, source, status, created_at, updated_at) "
@@ -247,6 +251,73 @@ class Store:
                 not self.one("SELECT 1 FROM unsubs WHERE entry_id=? AND mailbox=?", e["id"], mailbox):
             self.x("INSERT INTO unsubs(entry_id, mailbox, header, post, created_at) VALUES(?,?,?,?,?)",
                    e["id"], mailbox, list_unsub, list_unsub_post or "", ts)
+        return action
+
+    # ---------- ручное «в спам» из бота ----------
+    def spam_hits(self, kind, value):
+        """Записи спам-правила, которые уже покрывают адрес или домен: адрес сам и домены (включая родительские).
+        -> [(kind, value, status)]"""
+        rule = self.learn_rule()
+        if not rule:
+            return []
+        if kind == "addr":
+            value = _norm_addr(value)
+            chain = domain_chain(domain_of(value))
+            sql = ("SELECT kind, value, status FROM entries WHERE rule_id=? AND ((kind='addr' AND value=?) OR "
+                   f"(kind='domain' AND value IN ({','.join('?' * len(chain))})))")
+            rows = self.q(sql, rule["id"], value, *chain)
+        else:
+            chain = domain_chain(value)
+            rows = self.q("SELECT kind, value, status FROM entries WHERE rule_id=? AND kind='domain' AND "
+                          f"value IN ({','.join('?' * len(chain))})", rule["id"], *chain)
+        return [(r["kind"], r["value"], r["status"]) for r in rows]
+
+    def other_rule_hits(self, kind, value):
+        """Что из этого адреса/домена уже лежит в других правилах (ПУЯНГ, БАНК, ДИСЛОКАЦИЯ, ...) — в фильтре.
+        Для домена — и сам домен (с родителями), и адреса / домены внутри него. -> [(имя правила, вид, значение)]"""
+        spam = self.learn_rule()
+        out = []
+        rows = self.q("SELECT e.kind, e.value, r.name AS rule FROM entries e JOIN rules r ON r.id=e.rule_id "
+                      "WHERE r.enabled=1 AND r.id != ? AND e.kind IN ('addr', 'domain') AND "
+                      "e.status IN ('active', 'unsubscribing') ORDER BY r.position, r.id", spam["id"] if spam else 0)
+        for r in rows:
+            if kind == "addr":
+                hit = (r["kind"] == "addr" and r["value"] == value) or \
+                      (r["kind"] == "domain" and domain_in(domain_of(value), {r["value"]}))
+            else:
+                inside = domain_of(r["value"]) if r["kind"] == "addr" else r["value"]
+                hit = domain_in(value, {inside}) if r["kind"] == "domain" else domain_in(inside, {value})
+                hit = hit or (r["kind"] == "domain" and domain_in(r["value"], {value}))
+            if hit:
+                out.append((r["rule"], r["kind"], r["value"]))
+        return out
+
+    def manual_spam(self, kind, value, now=None):
+        """Ручное «в спам» (кнопка в боте): адрес или домен целиком (с поддоменами) в спам-правило.
+        Отписку не делаем (письма от спамера мы сами не просили), сводку по ящикам откроем.
+        -> 'added' | 'returned' | None (уже в фильтре или нет правила спама)"""
+        rule = self.learn_rule()
+        if not rule or kind not in ("addr", "domain"):
+            return None
+        value = _norm_addr(value) if kind == "addr" else _norm_domain(value)
+        if not value:
+            return None
+        if any(st in IN_FILTER for _, _, st in self.spam_hits(kind, value)):
+            return None
+        ts = now_iso(now)
+        if kind == "addr":   # последнее слово за пользователем: из других обучаемых папок (БАНК, ...) снимаем
+            self.x("UPDATE entries SET status='removed', updated_at=? WHERE kind='addr' AND value=? AND "
+                   "rule_id!=? AND status IN ('active','unsubscribing') AND "
+                   "rule_id IN (SELECT id FROM rules WHERE learn=1)", ts, value, rule["id"])
+        e = self.one("SELECT * FROM entries WHERE rule_id=? AND kind=? AND value=?", rule["id"], kind, value)
+        if e is None:
+            self.x("INSERT INTO entries(rule_id, kind, value, source, status, no_unsub, created_at, updated_at) "
+                   "VALUES(?,?,?,'manual','active',1,?,?)", rule["id"], kind, value, ts, ts)
+            action = "added"
+        else:
+            self.x("UPDATE entries SET status='active', no_unsub=1, hidden=0, updated_at=? WHERE id=?", ts, e["id"])
+            action = "returned"
+        self.open_report(value if kind == "addr" else "@" + value, "", action, rule_id=rule["id"], now=now)
         return action
 
     def pending_unsubs(self):
@@ -292,8 +363,15 @@ class Store:
         for r in self.q("SELECT id, sender, boxes, rule_id FROM reports WHERE done_at IS NULL"):
             rid = r["rule_id"] or (spam["id"] if spam else None)
             boxes = json.loads(r["boxes"])
-            if mailbox not in boxes and f"{rid}:a:{r['sender']}" in swept_keys:
-                boxes[mailbox] = moved_by_sender.get(r["sender"], 0)
+            if r["sender"].startswith("@"):      # отчёт по домену: считаем письма всех его адресов и поддоменов
+                dom = r["sender"][1:]
+                key = f"{rid}:d:{dom}"
+                moved = sum(n for s, n in moved_by_sender.items() if domain_in(domain_of(s), {dom}))
+            else:
+                key = f"{rid}:a:{r['sender']}"
+                moved = moved_by_sender.get(r["sender"], 0)
+            if mailbox not in boxes and key in swept_keys:
+                boxes[mailbox] = moved
                 self.x("UPDATE reports SET boxes=? WHERE id=?", json.dumps(boxes, ensure_ascii=False), r["id"])
 
     def ready_reports(self, mailboxes, timeout_min=30, now=None):
@@ -305,16 +383,18 @@ class Store:
             boxes = json.loads(r["boxes"])
             timed_out = r["created_at"] < now_iso(now - timedelta(minutes=timeout_min))
             rule = self.one("SELECT * FROM rules WHERE id=?", r["rule_id"] or (spam["id"] if spam else 0))
-            entry = self.one("SELECT id, no_unsub FROM entries WHERE rule_id=? AND kind='addr' AND value=?",
-                             rule["id"] if rule else 0, r["sender"])
+            is_domain = r["sender"].startswith("@")
+            entry = self.one("SELECT id, no_unsub FROM entries WHERE rule_id=? AND kind=? AND value=?",
+                             rule["id"] if rule else 0, "domain" if is_domain else "addr", r["sender"].lstrip("@"))
             unsubs = self.q("SELECT mailbox, status, result FROM unsubs WHERE entry_id=? ORDER BY id",
-                            entry["id"]) if entry else []
+                            entry["id"]) if entry and not is_domain else []
             if any(u["status"] == "pending" for u in unsubs) and not timed_out:
                 continue
             if set(mailboxes) <= set(boxes) or timed_out:
                 out.append({"id": r["id"], "sender": r["sender"], "mailbox": r["mailbox"], "action": r["action"],
                             "boxes": boxes, "missing": sorted(set(mailboxes) - set(boxes)),
                             "unsubs": [dict(u) for u in unsubs], "no_unsub": bool(entry and entry["no_unsub"]),
+                            "manual": not r["mailbox"], "domain": is_domain,
                             "folder": rule["move_to"] if rule else "?",
                             "spam": bool(rule and rule["unsubscribe"])})
         return out

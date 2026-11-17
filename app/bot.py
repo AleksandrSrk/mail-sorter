@@ -17,9 +17,12 @@ from .db import Store
 
 log = logging.getLogger("bot")
 BUTTONS = {"📧 Спам-адреса": "a", "🌐 Спам-домены": "d", "🙈 Скрытые": "h", "📭 Отписанные": "u"}
-ASK = {"🔎 Проверить адрес": "check"}
+ASK = {"🔎 Проверить адрес": "check", "🚫 В СПАМ": "spam"}
 PROMPT = {"check": "Пришли адрес (можно несколько, можно прямо строкой из письма вроде «ООО Ромашка <info@x.ru>») — "
-                   "покажу, в каких списках он есть, и дам кнопки убрать."}
+                   "покажу, в каких списках он есть, и дам кнопки убрать.",
+          "spam": "Пришли адрес или домен (можно несколько): name@domain.ru, @domain.ru, domain.ru или строкой из письма. "
+                  "Проверю, нет ли уже в спаме, и спрошу подтверждение. Домен блокируется вместе с поддоменами."}
+SPAM_WINDOW = 300   # сек.: после кнопки «В СПАМ» любое сообщение считается адресом/доменом для спама
 MENU = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text=t) for t in list(BUTTONS)[:2]], [KeyboardButton(text=t) for t in list(BUTTONS)[2:]],
               [KeyboardButton(text=t) for t in ASK]],
@@ -36,6 +39,8 @@ def markup(rows):
 def build_router(store: Store, admin_id: int, own_domains=()) -> Router:
     r = Router()
     waiting = {}  # chat_id -> "check": ждём адрес после нажатия кнопки
+    spam_until = {}  # chat_id -> до какого момента сообщения идут в «В СПАМ» (повторная отправка = подтверждение)
+    desk = views.SpamDesk(store, own_domains)
     r.message.filter(F.from_user.id == admin_id)          # все остальные — тишина
     r.callback_query.filter(F.from_user.id == admin_id)
 
@@ -46,16 +51,28 @@ def build_router(store: Store, admin_id: int, own_domains=()) -> Router:
 
     @r.message(F.text.in_(BUTTONS))
     async def show(m: Message):
+        spam_until.pop(m.chat.id, None)
         text, rows = views.SCREENS[BUTTONS[m.text]](store, 0)
         await m.answer(text, reply_markup=markup(rows))
 
     @r.message(F.text.in_(ASK))
     async def ask(m: Message):
-        waiting[m.chat.id] = ASK[m.text]
-        await m.answer(PROMPT[ASK[m.text]])
+        mode = ASK[m.text]
+        if mode == "spam":
+            waiting.pop(m.chat.id, None)
+            spam_until[m.chat.id] = time.time() + SPAM_WINDOW
+        else:
+            spam_until.pop(m.chat.id, None)
+            waiting[m.chat.id] = mode
+        await m.answer(PROMPT[mode])
 
     @r.message(F.text)
     async def addresses_input(m: Message):
+        if spam_until.get(m.chat.id, 0) > time.time():     # режим «В СПАМ»: адрес или домен
+            spam_until[m.chat.id] = time.time() + SPAM_WINDOW
+            text, rows = desk.request(m.text)
+            await m.answer(text[:4000], reply_markup=markup(rows) or MENU)
+            return
         mode = waiting.pop(m.chat.id, None)
         addrs = views.parse_addresses(m.text)
         if not addrs:
@@ -88,6 +105,16 @@ def build_router(store: Store, admin_id: int, own_domains=()) -> Router:
     @r.callback_query(F.data.startswith("n:"))
     async def notice(c: CallbackQuery):
         result, note = views.notice_action(store, c.data)
+        if result:
+            try:
+                await c.message.edit_text(f"{c.message.text}\n\n{result}"[:4000], reply_markup=None)
+            except TelegramBadRequest:
+                pass
+        await c.answer(note)
+
+    @r.callback_query(F.data.startswith("s:"))
+    async def spam_decide(c: CallbackQuery):
+        result, note = desk.decide(c.data)
         if result:
             try:
                 await c.message.edit_text(f"{c.message.text}\n\n{result}"[:4000], reply_markup=None)

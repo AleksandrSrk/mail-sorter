@@ -3,8 +3,10 @@
 Экран = (текст, ряды кнопок [[(подпись, callback_data), ...], ...]).
 callback_data: "<список>:<действие>:<id>:<страница>"  (лимит Telegram — 64 байта)."""
 import re
+import time
 from math import ceil
 
+from .config import domain_chain, domain_in
 from .db import IN_FILTER, Store, domain_of, now_iso
 from .scoring import FREE, SUSPICIOUS, score_addr, score_domain
 from .snippet import summarize_correspondence
@@ -175,8 +177,9 @@ SCREENS = {"a": addresses, "d": domains, "h": hidden, "u": unsubscribed}
 def _remove_domain(store, rid, domain):
     ts = now_iso()
     store.x(f"UPDATE entries SET status='removed', updated_at=? WHERE rule_id=? AND status IN "
-            f"({','.join('?' * len(IN_FILTER))}) AND ((kind='domain' AND value=?) OR (kind='addr' AND value LIKE ?))",
-            ts, rid, *IN_FILTER, domain, "%@" + domain)
+            f"({','.join('?' * len(IN_FILTER))}) AND ((kind='domain' AND value=?) OR "
+            f"(kind='addr' AND (value LIKE ? OR value LIKE ?)))",
+            ts, rid, *IN_FILTER, domain, "%@" + domain, "%." + domain)   # адреса домена и его поддоменов
 
 
 def act(store, data: str):
@@ -248,9 +251,11 @@ def check_screen(store, addr: str, own_domains=()):
     lines = [f"🔎 {addr}"]
     if dom in own_domains:
         lines.append("Свой домен — спамом не считается и автоматически не учится.")
+    chain = domain_chain(dom)   # запись «весь домен» действует и на поддомены
     rows = store.q("SELECT e.*, r.name AS rule, r.mailbox AS rmb, r.unsubscribe AS is_spam FROM entries e "
-                   "JOIN rules r ON r.id=e.rule_id WHERE (e.kind='addr' AND e.value=?) OR (e.kind='domain' AND e.value=?) "
-                   "ORDER BY r.position, r.id", addr, dom)
+                   "JOIN rules r ON r.id=e.rule_id WHERE (e.kind='addr' AND e.value=?) OR "
+                   f"(e.kind='domain' AND e.value IN ({','.join('?' * len(chain))})) "
+                   "ORDER BY r.position, r.id", addr, *chain)
     if not rows:
         lines.append("Ни в одном списке нет.")
     for e in rows:
@@ -333,6 +338,138 @@ def restore(store, entry_id: int, own_domains=()):
         text, rows = check_screen(store, addr, own_domains)
         return (text + "\n\n" + note, rows), "Готово"
     return (f"Домен @{e['value']}: {note}", []), "Готово"
+
+
+# ---------- ручное «В СПАМ»: адрес или домен прямо из бота ----------
+DOMAIN_RE = re.compile(r"^(?:[\w-]+\.)+(?:[^\W\d_]{2,}|xn--[\w-]+)$")
+TOKEN_SPLIT = re.compile(r"[\s,;<>()\[\]«»\"']+")
+WARN_TTL = 300          # секунд: защита от дурака — повторная отправка в этот срок подтверждает
+PENDING_TTL = 3600      # через час неподтверждённый запрос протухает
+
+
+def parse_targets(text: str) -> list[tuple[str, str]]:
+    """Из присланного текста: адреса и домены -> [('addr', 'a@b.ru'), ('domain', 'b.ru')], без дублей.
+    Домен можно прислать как «@b.ru», «b.ru» или ссылкой."""
+    out = [("addr", a) for a in parse_addresses(text)]
+    for tok in TOKEN_SPLIT.split(ADDR_RE.sub(" ", text or "")):
+        tok = re.sub(r"^[a-z]+://", "", tok.strip().lower())
+        tok = tok.split("/")[0].split("?")[0].lstrip("@").removeprefix("www.").strip(".:")
+        if DOMAIN_RE.match(tok) and ("domain", tok) not in out:
+            out.append(("domain", tok))
+    return out
+
+
+def _label(kind, value):
+    return value if kind == "addr" else f"домен {value} (и все поддомены)"
+
+
+class SpamDesk:
+    """Кнопка «🚫 В СПАМ»: разбор текста → проверки → одно общее подтверждение → запись в спам-правило.
+    Обход ящиков и сводку делает сортировщик (как и для обучения жестом); тут только решение и запись."""
+
+    def __init__(self, store: Store, own_domains=(), clock=time.time):
+        self.store, self.own, self.clock = store, set(own_domains), clock
+        self.pending = {}      # токен -> (когда, [(вид, значение)])
+        self.warned = {}       # (вид, значение) -> когда предупредили про белый список
+        self._seq = 0
+
+    def _purge(self, now):
+        self.pending = {t: v for t, v in self.pending.items() if now - v[0] <= PENDING_TTL}
+        self.warned = {k: t for k, t in self.warned.items() if now - t <= WARN_TTL}
+
+    def _classify(self, kind, value, now):
+        """-> (статус, текст): ok / dup / own / warn."""
+        dom = value if kind == "domain" else domain_of(value)
+        if domain_in(dom, self.own):
+            return "own", "свой домен — спамом не считается, не трогаю"
+        hits = self.store.spam_hits(kind, value)
+        live = [h for h in hits if h[2] in IN_FILTER]
+        if live:
+            k, v, _ = live[0]
+            if k == "addr" or v == value:
+                return "dup", "уже в спам-фильтре"
+            return "dup", f"уже покрыт: домен {v} в спам-фильтре"
+        reasons = []
+        if kind == "domain" and domain_in(value, FREE):
+            reasons.append("бесплатная почта — весь домен блокировать опасно")
+        for name in dict.fromkeys(n for n, _, _ in self.store.other_rule_hits(kind, value)):
+            reasons.append(f"есть в правиле «{name}»")
+        notes = []
+        if reasons:
+            key = (kind, value)
+            if now - self.warned.get(key, -WARN_TTL - 1) > WARN_TTL:
+                self.warned[key] = now
+                return "warn", "; ".join(reasons)
+            self.warned.pop(key, None)
+            notes.append("; ".join(reasons) + " — подтверждено повторной отправкой")
+        by_addr, by_domain = self.store.contacts()
+        sent = by_addr.get(value, 0) if kind == "addr" else \
+            sum(n for d, n in by_domain.items() if domain_in(d, {value}))
+        if sent:
+            notes.append(f"⚠️ мы туда писали {sent} раз")
+        if any(h[2] == "unsubscribed" for h in hits):
+            notes.append("был в «Отписанных» — вернётся в фильтр, без новой отписки")
+        elif any(h[2] == "removed" for h in hits):
+            notes.append("ты раньше снимал его с фильтра")
+        return "ok", "; ".join(notes)
+
+    def request(self, text: str):
+        """Прислали текст после кнопки «В СПАМ». -> (текст ответа, кнопки)"""
+        targets = parse_targets(text)
+        if not targets:
+            return ("Не вижу ни адреса, ни домена. Пришли что-то вроде name@domain.ru, @domain.ru или domain.ru "
+                    "(можно сразу несколько).", [])
+        now = self.clock()
+        self._purge(now)
+        groups = {"ok": [], "dup": [], "warn": [], "own": []}
+        for kind, value in targets:
+            status, note = self._classify(kind, value, now)
+            groups[status].append((kind, value, note))
+
+        def block(title, items):
+            if not items:
+                return []
+            return ["", title] + [f"  • {_label(k, v)}" + (f" — {n}" if n else "") for k, v, n in items]
+
+        lines = ["🚫 В СПАМ — проверил."]
+        lines += block(f"Добавлю в спам-фильтр ({len(groups['ok'])}):", groups["ok"])
+        lines += block("Уже в спаме:", groups["dup"])
+        lines += block("🛑 Свои домены:", groups["own"])
+        if groups["warn"]:
+            lines += block("⚠️ Защита от случайности — не добавил:", groups["warn"])
+            lines.append("Если это реально нужно — пришли это же ещё раз в течение 5 минут.")
+        rows = []
+        if groups["ok"]:
+            self._seq += 1
+            self.pending[self._seq] = (now, [(k, v) for k, v, _ in groups["ok"]])
+            rows = [[("✅ ОК, в спам", f"s:ok:{self._seq}:0"), ("Отмена", f"s:no:{self._seq}:0")]]
+        else:
+            lines += ["", "Добавлять нечего."]
+        return "\n".join(lines), rows
+
+    def decide(self, data: str):
+        """Кнопки ОК / Отмена. -> (текст-итог для замены сообщения | None, короткий ответ)"""
+        try:
+            _, action, token, _ = data.split(":")
+            token = int(token)
+        except ValueError:
+            return None, "Устаревшая кнопка"
+        item = self.pending.pop(token, None)
+        if item is None:
+            return None, "Устаревшая кнопка"
+        if action == "no":
+            return "Отменено, ничего не добавлял.", "Отменено"
+        done, skipped = [], []
+        for kind, value in item[1]:
+            (done if self.store.manual_spam(kind, value) else skipped).append(_label(kind, value))
+        lines = []
+        if done:
+            lines += [f"✅ В спам-фильтре ({len(done)}):"] + [f"  • {x}" for x in done]
+        if skipped:
+            lines += ["Уже было в фильтре:"] + [f"  • {x}" for x in skipped]
+        if done:
+            lines += ["", "Обхожу все ящики. Когда закончу, пришлю сводку: где сколько писем нашлось и перенесено."]
+        return "\n".join(lines), "Принято"
 
 
 # ---------- серверный спам: уведомление и решение ----------

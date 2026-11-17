@@ -8,7 +8,8 @@ import re
 from collections import Counter, namedtuple
 
 from . import imap_utf7
-from .config import DEFAULT_SKIP_FOLDERS, LearnSpam, Rule
+from .config import DEFAULT_SKIP_FOLDERS, LearnSpam, Rule, domain_in
+from .db import domain_of
 from .snippet import body_text, short
 
 log = logging.getLogger("sorter")
@@ -313,7 +314,7 @@ class MailboxSorter:
             for a in r.senders:
                 out[f"{r.id}:a:{a}"] = a
             for d in r.sender_domains:
-                out[f"{r.id}:d:{d}"] = "@" + d
+                out[f"{r.id}:d:{d}"] = d   # без «@»: IMAP FROM ищет подстроку, так находятся и поддомены
         return out
 
     def _sweep(self, m, folders, dest, needles) -> tuple[int, set]:
@@ -446,11 +447,12 @@ class MailboxSorter:
             if raw:
                 typ, _ = m.select(_quote(raw))
                 if typ == "OK":
-                    typ, d = m.uid("SEARCH", None, "FROM", _quote(job["needle"]))
-                    found = d[0].split() if typ == "OK" and d and d[0] else []
                     needle = job["needle"].lower()
+                    typ, d = m.uid("SEARCH", None, "FROM", _quote(needle.lstrip("@")))
+                    found = d[0].split() if typ == "OK" and d and d[0] else []
                     uids = [uid for uid, h in self._fetch_headers(m, found).items()
-                            if (h.sender == needle if not needle.startswith("@") else h.sender.endswith(needle))]
+                            if (h.sender == needle if not needle.startswith("@")
+                                else domain_in(domain_of(h.sender), {needle[1:]}))]
                     if uids:
                         self._move(m, uids, "INBOX", mark_read=False)
                         n = len(uids)
