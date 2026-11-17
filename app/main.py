@@ -108,14 +108,50 @@ def format_report(r) -> str:
     return "\n".join(lines)
 
 
+def format_manual_batch(items) -> str:
+    """Несколько адресов/доменов, добавленных вручную из бота за раз, — одна сводка вместо кучи сообщений."""
+    def label(r):
+        return f"домен {r['sender'][1:]} (и поддомены)" if r.get("domain") else r["sender"]
+
+    returned = [r for r in items if r["action"] == "returned"]
+    head = f"🚫 В спам-фильтр добавлено вручную из бота: {len(items)}"
+    if returned:
+        head += f" (из них снова: {len(returned)})"
+    lines = [head, ""]
+    found = [r for r in items if any(r["boxes"].values())]
+    empty = [r for r in items if not any(r["boxes"].values())]
+    if found:
+        lines.append("Старые письма перенесены в спам:")
+        for r in sorted(found, key=lambda r: -sum(r["boxes"].values())):
+            moved = {mb: n for mb, n in r["boxes"].items() if n}
+            where = ", ".join(f"{mb} — {n}" for mb, n in sorted(moved.items(), key=lambda x: -x[1]))
+            lines.append(f"  • {label(r)}: {sum(moved.values())} ({where})")
+    if empty:
+        lines += ["", "Писем не нашлось:"] + [f"  • {label(r)}" for r in empty]
+    missing = sorted({mb for r in items for mb in r["missing"]})
+    if missing:
+        lines += ["", "⚠️ Не проверены (ящик недоступен): " + ", ".join(missing)]
+    lines += ["", "Отписку не делаю — добавлено вручную."]
+    return "\n".join(lines)
+
+
 def send_reports(store, settings, notifier, log):
-    """Сводка по каждому новому адресу: сколько старых писем и где перенесено, чем кончилась отписка."""
+    """Сводка по каждому новому адресу: сколько старых писем и где перенесено, чем кончилась отписка.
+    Добавленное вручную из бота за один заход уходит одним сообщением."""
     try:
-        for r in store.ready_reports(list(settings.mailboxes)):
-            text = format_report(r)
+        ready = store.ready_reports(list(settings.mailboxes))
+        manual = [r for r in ready if r.get("manual") and r.get("spam", True)]
+        groups = [([r], format_report(r)) for r in ready if r not in manual]
+        if len(manual) == 1:
+            groups.append((manual, format_report(manual[0])))
+        elif manual:
+            groups.append((manual, format_manual_batch(manual)))
+        for rs, text in groups:
             log.info("отчёт: %s", text.replace("\n", " | "))
-            if notifier.send(f"report:{r['id']}", text, force=True) or not notifier.enabled:
-                store.close_report(r["id"])
+            key = f"report:{rs[0]['id']}" if len(rs) == 1 else f"report:batch:{rs[0]['id']}-{rs[-1]['id']}"
+            if notifier.send(key, text, force=True) or not notifier.enabled:
+                for r in rs:
+                    store.close_report(r["id"])
     except Exception as e:
         log.error("ошибка в отчётах: %s", e)
         notifier.send(f"err:report:{type(e).__name__}", "❌ ошибка в отчётах", f"{e}\n\n{traceback.format_exc()[-2500:]}")

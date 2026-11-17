@@ -210,6 +210,30 @@ def test_domain_report_counts_subdomain_letters(store):
     assert "от него не было" in format_report(a)
 
 
+def test_manual_reports_go_out_as_one_message(store):
+    import logging
+    from types import SimpleNamespace
+    from app import main
+    rid = store.learn_rule()["id"]
+    for kind, value in (("addr", "one@alone.ru"), ("addr", "two@alone.ru"), ("domain", "dom.ru")):
+        store.manual_spam(kind, value)
+    swept = {f"{rid}:a:one@alone.ru", f"{rid}:a:two@alone.ru", f"{rid}:d:dom.ru"}
+    store.report_progress("m1@our.ru", swept, Counter({"one@alone.ru": 3, "a@dom.ru": 1}))
+    store.report_progress("m2@our.ru", swept, Counter({"one@alone.ru": 1}))
+    sent = []
+    notifier = SimpleNamespace(send=lambda key, subj, body="", force=False: sent.append(subj) or True, enabled=True)
+    settings = SimpleNamespace(mailboxes={"m1@our.ru": 1, "m2@our.ru": 1})
+    main.send_reports(store, settings, notifier, logging.getLogger("t"))
+    assert len(sent) == 1
+    t = sent[0]
+    assert "добавлено вручную из бота: 3" in t
+    assert "one@alone.ru: 4 (m1@our.ru — 3, m2@our.ru — 1)" in t and "домен dom.ru (и поддомены): 1 (m1@our.ru — 1)" in t
+    assert "Писем не нашлось:" in t and "  • two@alone.ru" in t and t.count("Отписку не делаю") == 1
+    assert store.ready_reports(["m1@our.ru", "m2@our.ru"]) == []     # все закрыты
+    main.send_reports(store, settings, notifier, logging.getLogger("t"))
+    assert len(sent) == 1
+
+
 def test_sweep_finds_subdomain_senders_and_moves_them(store):
     fake = FakeIMAP({
         "INBOX": {"validity": 1, "msgs": {1: ("x@spamlog.example", "a", False), 2: ("y@mail.spamlog.example", "b", False),
