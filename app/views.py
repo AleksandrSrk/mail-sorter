@@ -413,6 +413,26 @@ class SpamDesk:
             notes.append("ты раньше снимал его с фильтра")
         return "ok", "; ".join(notes)
 
+    @staticmethod
+    def _headline(groups) -> str:
+        """Первая строка ответа — итог проверки по базе, а не просто «проверил»."""
+        total = sum(len(g) for g in groups.values())
+        if total == 1:
+            status, items = next((s, g) for s, g in groups.items() if g)
+            kind, value, note = items[0]
+            what = value if kind == "addr" else f"домен {value}"
+            verdict = {"ok": "новый, в фильтре его ещё нет", "dup": note,
+                       "warn": "под защитой, не добавил", "own": "свой домен, не трогаю"}[status]
+            return f"🚫 В СПАМ — {what}: {verdict}"
+        n_ok, n_dup = len(groups["ok"]), len(groups["dup"])
+        if n_dup == total:
+            return f"🚫 В СПАМ — всё уже в спаме ({total})"
+        parts = [f"новых: {n_ok}"]
+        for key, title in (("dup", "уже в спаме"), ("warn", "под защитой"), ("own", "свои домены")):
+            if groups[key]:
+                parts.append(f"{title}: {len(groups[key])}")
+        return "🚫 В СПАМ — " + ", ".join(parts)
+
     def request(self, text: str):
         """Прислали текст после кнопки «В СПАМ». -> (текст ответа, кнопки)"""
         targets = parse_targets(text)
@@ -431,7 +451,7 @@ class SpamDesk:
                 return []
             return ["", title] + [f"  • {_label(k, v)}" + (f" — {n}" if n else "") for k, v, n in items]
 
-        lines = ["🚫 В СПАМ — проверил."]
+        lines = [self._headline(groups)]
         lines += block(f"Добавлю в спам-фильтр ({len(groups['ok'])}):", groups["ok"])
         lines += block("Уже в спаме:", groups["dup"])
         lines += block("🛑 Свои домены:", groups["own"])

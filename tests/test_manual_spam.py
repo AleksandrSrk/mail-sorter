@@ -105,6 +105,25 @@ def test_desk_duplicates_and_own_domains(store):
     assert "Добавлю в спам-фильтр (1)" in text and "Уже в спаме" in text and rows
 
 
+def test_desk_headline_shows_check_result(store):
+    desk = desk_for(store)
+    first = lambda t: t.splitlines()[0]  # noqa: E731
+    text, rows = desk.request("fresh@new.ru")
+    assert first(text) == "🚫 В СПАМ — fresh@new.ru: новый, в фильтре его ещё нет"
+    desk.decide(rows[0][0][1])
+    assert first(desk.request("fresh@new.ru")[0]) == "🚫 В СПАМ — fresh@new.ru: уже в спам-фильтре"
+    assert first(desk.request("x@sub.new.ru")[0]) == "🚫 В СПАМ — x@sub.new.ru: новый, в фильтре его ещё нет"
+    desk.decide(desk.request("junk3.ru")[1][0][0][1])
+    assert first(desk.request("a@junk3.ru")[0]) == \
+        "🚫 В СПАМ — a@junk3.ru: уже покрыт: домен junk3.ru в спам-фильтре"
+    assert first(desk.request("gmail.com")[0]) == "🚫 В СПАМ — домен gmail.com: под защитой, не добавил"
+    assert first(desk.request("boss@our.ru")[0]) == "🚫 В СПАМ — boss@our.ru: свой домен, не трогаю"
+    assert first(desk.request("fresh@new.ru junk3.ru")[0]) == "🚫 В СПАМ — всё уже в спаме (2)"
+    mixed = desk.request("fresh@new.ru new2@new.ru yahoo.com boss@our.ru")[0]   # gmail.com уже «предупреждён» выше
+    assert first(mixed) == "🚫 В СПАМ — новых: 1, уже в спаме: 1, под защитой: 1, свои домены: 1"
+    assert first(desk.request("n1@a.ru n2@b.ru")[0]) == "🚫 В СПАМ — новых: 2"
+
+
 def test_desk_whitelist_needs_resend_within_five_minutes(store):
     clock = Clock()
     desk = desk_for(store, clock)
