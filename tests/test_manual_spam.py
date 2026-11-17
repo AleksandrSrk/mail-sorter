@@ -124,6 +124,25 @@ def test_desk_headline_shows_check_result(store):
     assert first(desk.request("n1@a.ru n2@b.ru")[0]) == "🚫 В СПАМ — новых: 2"
 
 
+def test_desk_single_item_has_no_duplicate_blocks(store):
+    desk = desk_for(store)
+    text, rows = desk.request("fresh@new.ru")                       # новый: заголовок + кнопки, без блока «Добавлю»
+    assert text == "🚫 В СПАМ — fresh@new.ru: новый, в фильтре его ещё нет" and rows
+    desk.decide(rows[0][0][1])
+    text, rows = desk.request("fresh@new.ru")                       # дубль: только заголовок и «нечего добавлять»
+    assert text == ("🚫 В СПАМ — fresh@new.ru: уже в спам-фильтре\n\nДобавлять нечего.") and rows == []
+    text, _ = desk.request("boss@our.ru")
+    assert text == "🚫 В СПАМ — boss@our.ru: свой домен, не трогаю\n\nДобавлять нечего."
+    text, _ = desk.request("gmail.com")                             # защита: причина и подсказка про повтор
+    assert "Защита от случайности: бесплатная почта" in text and "ещё раз в течение 5 минут" in text
+    assert "Уже в спаме" not in text and "Добавлю" not in text
+    store.add_contacts(["client@corp.ru"])
+    text, rows = desk.request("client@corp.ru")                     # заметка про переписку остаётся
+    assert "Заметка: ⚠️ мы туда писали 1 раз" in text and rows
+    text, _ = desk.request("a@x.ru b@y.ru")                         # пачка: блоки на месте
+    assert "Добавлю в спам-фильтр (2)" in text
+
+
 def test_desk_whitelist_needs_resend_within_five_minutes(store):
     clock = Clock()
     desk = desk_for(store, clock)

@@ -452,12 +452,21 @@ class SpamDesk:
             return ["", title] + [f"  • {_label(k, v)}" + (f" — {n}" if n else "") for k, v, n in items]
 
         lines = [self._headline(groups)]
-        lines += block(f"Добавлю в спам-фильтр ({len(groups['ok'])}):", groups["ok"])
-        lines += block("Уже в спаме:", groups["dup"])
-        lines += block("🛑 Свои домены:", groups["own"])
-        if groups["warn"]:
-            lines += block("⚠️ Защита от случайности — не добавил:", groups["warn"])
-            lines.append("Если это реально нужно — пришли это же ещё раз в течение 5 минут.")
+        if len(targets) == 1:      # один адрес/домен: всё уже сказано в заголовке, блоки только повторяли бы его
+            status, items = next((s, g) for s, g in groups.items() if g)
+            note = items[0][2]
+            if status == "ok" and note:
+                lines += ["", f"Заметка: {note}"]
+            elif status == "warn":
+                lines += ["", f"⚠️ Защита от случайности: {note}.",
+                          "Если это реально нужно — пришли это же ещё раз в течение 5 минут."]
+        else:
+            lines += block(f"Добавлю в спам-фильтр ({len(groups['ok'])}):", groups["ok"])
+            lines += block("Уже в спаме:", groups["dup"])
+            lines += block("🛑 Свои домены:", groups["own"])
+            if groups["warn"]:
+                lines += block("⚠️ Защита от случайности — не добавил:", groups["warn"])
+                lines.append("Если это реально нужно — пришли это же ещё раз в течение 5 минут.")
         rows = []
         if groups["ok"]:
             self._seq += 1
